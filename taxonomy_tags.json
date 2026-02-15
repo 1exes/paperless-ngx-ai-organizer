@@ -1,0 +1,376 @@
+{
+  "version": 1,
+  "description": "Feste Tag-Taxonomie fuer den Organizer. Nur diese Tags sind zulaessig.",
+  "tags": [
+    {
+      "name": "Arbeit",
+      "synonyms": [
+        "job",
+        "beruf",
+        "employment"
+      ],
+      "color": "#e74c3c",
+      "description": "Kategorie fuer Arbeit. Synonyme: job, beruf, employment."
+    },
+    {
+      "name": "WBS",
+      "synonyms": [
+        "wbs training",
+        "wbs training ag"
+      ],
+      "color": "#2ecc71",
+      "description": "Kategorie fuer WBS. Synonyme: wbs training, wbs training ag."
+    },
+    {
+      "name": "msg",
+      "synonyms": [
+        "msg systems",
+        "msg systems ag"
+      ],
+      "color": "#3498db",
+      "description": "Kategorie fuer msg. Synonyme: msg systems, msg systems ag."
+    },
+    {
+      "name": "Vertrag",
+      "synonyms": [
+        "contract",
+        "arbeitsvertrag",
+        "aufhebungsvertrag"
+      ],
+      "color": "#f39c12",
+      "description": "Kategorie fuer Vertrag. Synonyme: contract, arbeitsvertrag, aufhebungsvertrag."
+    },
+    {
+      "name": "Rechnung",
+      "synonyms": [
+        "invoice",
+        "bill"
+      ],
+      "color": "#9b59b6",
+      "description": "Kategorie fuer Rechnung. Synonyme: invoice, bill."
+    },
+    {
+      "name": "Mahnung",
+      "synonyms": [
+        "reminder",
+        "zahlungserinnerung"
+      ],
+      "color": "#1abc9c",
+      "description": "Kategorie fuer Mahnung. Synonyme: reminder, zahlungserinnerung."
+    },
+    {
+      "name": "Steuern",
+      "synonyms": [
+        "tax",
+        "steuer",
+        "steuerbescheid"
+      ],
+      "color": "#e67e22",
+      "description": "Kategorie fuer Steuern. Synonyme: tax, steuer, steuerbescheid."
+    },
+    {
+      "name": "Finanzen",
+      "synonyms": [
+        "finance",
+        "konto",
+        "bank"
+      ],
+      "color": "#2980b9",
+      "description": "Kategorie fuer Finanzen. Synonyme: finance, konto, bank."
+    },
+    {
+      "name": "Depot",
+      "synonyms": [
+        "broker",
+        "etf",
+        "wertpapier"
+      ],
+      "color": "#27ae60",
+      "description": "Kategorie fuer Depot. Synonyme: broker, etf, wertpapier."
+    },
+    {
+      "name": "Versicherung",
+      "synonyms": [
+        "insurance",
+        "police"
+      ],
+      "color": "#c0392b",
+      "description": "Kategorie fuer Versicherung. Synonyme: insurance, police."
+    },
+    {
+      "name": "Gesundheit",
+      "synonyms": [
+        "health",
+        "arzt",
+        "medizin"
+      ],
+      "color": "#8e44ad",
+      "description": "Kategorie fuer Gesundheit. Synonyme: health, arzt, medizin."
+    },
+    {
+      "name": "AOK",
+      "synonyms": [
+        "aok plus",
+        "krankenkasse"
+      ],
+      "color": "#16a085",
+      "description": "Kategorie fuer AOK. Synonyme: aok plus, krankenkasse."
+    },
+    {
+      "name": "Auto",
+      "synonyms": [
+        "kfz",
+        "fahrzeug",
+        "car"
+      ],
+      "color": "#d35400",
+      "description": "Kategorie fuer Auto. Synonyme: kfz, fahrzeug, car."
+    },
+    {
+      "name": "Service",
+      "synonyms": [
+        "wartung",
+        "maintenance"
+      ],
+      "color": "#2c3e50",
+      "description": "Kategorie fuer Service. Synonyme: wartung, maintenance."
+    },
+    {
+      "name": "Termin",
+      "synonyms": [
+        "appointment",
+        "meeting"
+      ],
+      "color": "#f1c40f",
+      "description": "Kategorie fuer Termin. Synonyme: appointment, meeting."
+    },
+    {
+      "name": "DRK",
+      "synonyms": [
+        "deutsches rotes kreuz",
+        "wasserwacht",
+        "blutspende"
+      ],
+      "color": "#e91e63",
+      "description": "Kategorie fuer DRK. Synonyme: deutsches rotes kreuz, wasserwacht, blutspende."
+    },
+    {
+      "name": "Ausbildung",
+      "synonyms": [
+        "apprenticeship",
+        "fachinformatiker",
+        "lehre"
+      ],
+      "color": "#00bcd4",
+      "description": "Kategorie fuer Ausbildung. Synonyme: apprenticeship, fachinformatiker, lehre."
+    },
+    {
+      "name": "Zeugnis",
+      "synonyms": [
+        "certificate",
+        "arbeitszeugnis"
+      ],
+      "color": "#ff5722",
+      "description": "Kategorie fuer Zeugnis. Synonyme: certificate, arbeitszeugnis."
+    },
+    {
+      "name": "Bewerbung",
+      "synonyms": [
+        "application",
+        "cv",
+        "lebenslauf"
+      ],
+      "color": "#607d8b",
+      "description": "Kategorie fuer Bewerbung. Synonyme: application, cv, lebenslauf."
+    },
+    {
+      "name": "Bescheinigung",
+      "synonyms": [
+        "confirmation",
+        "attest"
+      ],
+      "color": "#795548",
+      "description": "Kategorie fuer Bescheinigung. Synonyme: confirmation, attest."
+    },
+    {
+      "name": "Kontoauszug",
+      "synonyms": [
+        "statement",
+        "bankauszug"
+      ],
+      "color": "#e74c3c",
+      "description": "Kategorie fuer Kontoauszug. Synonyme: statement, bankauszug."
+    },
+    {
+      "name": "Lohn",
+      "synonyms": [
+        "gehalt",
+        "gehaltsabrechnung",
+        "payroll"
+      ],
+      "color": "#2ecc71",
+      "description": "Kategorie fuer Lohn. Synonyme: gehalt, gehaltsabrechnung, payroll."
+    },
+    {
+      "name": "Einkauf",
+      "synonyms": [
+        "purchase",
+        "bestellung",
+        "order"
+      ],
+      "color": "#3498db",
+      "description": "Kategorie fuer Einkauf. Synonyme: purchase, bestellung, order."
+    },
+    {
+      "name": "IT",
+      "synonyms": [
+        "software",
+        "saas",
+        "cloud"
+      ],
+      "color": "#f39c12",
+      "description": "Kategorie fuer IT. Synonyme: software, saas, cloud."
+    },
+    {
+      "name": "Hosting",
+      "synonyms": [
+        "server",
+        "domain",
+        "vps"
+      ],
+      "color": "#9b59b6",
+      "description": "Kategorie fuer Hosting. Synonyme: server, domain, vps."
+    },
+    {
+      "name": "KI",
+      "synonyms": [
+        "ai",
+        "llm",
+        "openai",
+        "elevenlabs"
+      ],
+      "color": "#1abc9c",
+      "description": "Kategorie fuer KI. Synonyme: ai, llm, openai."
+    },
+    {
+      "name": "Amazon",
+      "synonyms": [
+        "amazon.de"
+      ],
+      "color": "#e67e22",
+      "description": "Kategorie fuer Amazon. Synonyme: amazon.de."
+    },
+    {
+      "name": "Apple",
+      "synonyms": [
+        "icloud",
+        "apple services"
+      ],
+      "color": "#2980b9",
+      "description": "Kategorie fuer Apple. Synonyme: icloud, apple services."
+    },
+    {
+      "name": "DHL",
+      "synonyms": [
+        "paket",
+        "shipment",
+        "tracking"
+      ],
+      "color": "#27ae60",
+      "description": "Kategorie fuer DHL. Synonyme: paket, shipment, tracking."
+    },
+    {
+      "name": "CHECK24",
+      "synonyms": [
+        "check24 gmbh"
+      ],
+      "color": "#c0392b",
+      "description": "Kategorie fuer CHECK24. Synonyme: check24 gmbh."
+    },
+    {
+      "name": "AXA",
+      "synonyms": [
+        "axa versicherung"
+      ],
+      "color": "#8e44ad",
+      "description": "Kategorie fuer AXA. Synonyme: axa versicherung."
+    },
+    {
+      "name": "Baader",
+      "synonyms": [
+        "baader bank"
+      ],
+      "color": "#16a085",
+      "description": "Kategorie fuer Baader. Synonyme: baader bank."
+    },
+    {
+      "name": "Scalable",
+      "synonyms": [
+        "scalable capital"
+      ],
+      "color": "#d35400",
+      "description": "Kategorie fuer Scalable. Synonyme: scalable capital."
+    },
+    {
+      "name": "Digistore24",
+      "synonyms": [
+        "digistore"
+      ],
+      "color": "#2c3e50",
+      "description": "Kategorie fuer Digistore24. Synonyme: digistore."
+    },
+    {
+      "name": "Korrespondenz",
+      "synonyms": [
+        "mail",
+        "email",
+        "brief"
+      ],
+      "color": "#f1c40f",
+      "description": "Kategorie fuer Korrespondenz. Synonyme: mail, email, brief."
+    },
+    {
+      "name": "Formular",
+      "synonyms": [
+        "form"
+      ],
+      "color": "#e91e63",
+      "description": "Kategorie fuer Formular. Synonyme: form."
+    },
+    {
+      "name": "Urkunde",
+      "synonyms": [
+        "certificate document"
+      ],
+      "color": "#00bcd4",
+      "description": "Kategorie fuer Urkunde. Synonyme: certificate document."
+    },
+    {
+      "name": "Lizenz",
+      "synonyms": [
+        "license",
+        "lizenzschluessel"
+      ],
+      "color": "#ff5722",
+      "description": "Kategorie fuer Lizenz. Synonyme: license, lizenzschluessel."
+    },
+    {
+      "name": "Manuell-Pruefen",
+      "synonyms": [
+        "review",
+        "human review",
+        "nachpruefen"
+      ],
+      "color": "#607d8b",
+      "description": "Kategorie fuer Manuell-Pruefen. Synonyme: review, human review, nachpruefen."
+    },
+    {
+      "name": "Duplikat",
+      "synonyms": [
+        "duplicate"
+      ],
+      "color": "#795548",
+      "description": "Kategorie fuer Duplikat. Synonyme: duplicate."
+    }
+  ]
+}
