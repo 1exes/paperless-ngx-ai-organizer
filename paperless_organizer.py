@@ -1,9 +1,9 @@
-"""
+﻿"""
 Paperless-NGX Organizer - Unified Terminal App
 Vereint: main.py, cleanup.py, cleanup_correspondents.py, cleanup_doctypes.py,
          batch_delete_tags.py, find_duplicates.py, fast_cleanup.py
 
-Nutzt lokales LLM via LM Studio statt Claude CLI.
+Nutzt lokales LLM (Ollama/LM Studio/OpenAI-kompatibel) statt Claude CLI.
 Interaktive Rich Terminal-UI mit Menuesystem.
 """
 
@@ -18,9 +18,10 @@ import logging
 import sqlite3
 import threading
 import difflib
+import unicodedata
 import requests
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlencode, urlparse, urlunparse
@@ -34,11 +35,13 @@ from rich.logging import RichHandler
 load_dotenv()
 console = Console()
 
-# ── Logging-Setup ────────────────────────────────────────────────────────────
+# â”€â”€ Logging-Setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 LOG_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(LOG_DIR, "organizer.log")
 STATE_DB_FILE = os.path.join(LOG_DIR, "organizer_state.db")
 TAXONOMY_FILE = os.path.join(LOG_DIR, "taxonomy_tags.json")
+LEARNING_PROFILE_FILE = os.path.join(LOG_DIR, "learning_profile.json")
+LEARNING_EXAMPLES_FILE = os.path.join(LOG_DIR, "learning_examples.jsonl")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -240,12 +243,26 @@ class LocalStateDB:
             )
             return cur.rowcount > 0
 
+    def count_recent_document_statuses(self, doc_id: int, statuses: list[str], within_minutes: int) -> int:
+        if not statuses or within_minutes <= 0:
+            return 0
+        since = (datetime.now() - timedelta(minutes=within_minutes)).isoformat(timespec="seconds")
+        placeholders = ",".join("?" for _ in statuses)
+        params = [doc_id, *statuses, since]
+        query = (
+            f"SELECT COUNT(*) FROM documents "
+            f"WHERE doc_id = ? AND status IN ({placeholders}) AND created_at >= ?"
+        )
+        with self._lock, self._connect() as conn:
+            row = conn.execute(query, tuple(params)).fetchone()
+            return int((row or [0])[0])
 
-# ══════════════════════════════════════════════════════════════════════════════
+
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # CONFIG
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
-# --- LLM (LM Studio) ---
+# --- LLM (lokaler Server: Ollama/LM Studio/OpenAI-kompatibel) ---
 LLM_URL = os.getenv("LLM_URL", "http://127.0.0.1:1234/v1/chat/completions").strip()
 LLM_MODEL = os.getenv("LLM_MODEL", "").strip()
 LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
@@ -254,6 +271,14 @@ LLM_KEEP_ALIVE = os.getenv("LLM_KEEP_ALIVE", "").strip()
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1000"))
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "120"))
+LLM_CONNECT_TIMEOUT = int(os.getenv("LLM_CONNECT_TIMEOUT", "8"))
+LLM_COMPACT_TIMEOUT = int(os.getenv("LLM_COMPACT_TIMEOUT", "60"))
+LLM_COMPACT_TIMEOUT_RETRY = int(os.getenv("LLM_COMPACT_TIMEOUT_RETRY", str(max(LLM_COMPACT_TIMEOUT + 25, 75))))
+LLM_RETRY_COUNT = int(os.getenv("LLM_RETRY_COUNT", "2"))
+LLM_COMPACT_MAX_TOKENS = int(os.getenv("LLM_COMPACT_MAX_TOKENS", "320"))
+LLM_COMPACT_PROMPT_MAX_PATHS = int(os.getenv("LLM_COMPACT_PROMPT_MAX_PATHS", "20"))
+LLM_COMPACT_PROMPT_MAX_TAGS = int(os.getenv("LLM_COMPACT_PROMPT_MAX_TAGS", "24"))
+LLM_VERIFY_ON_LOW_CONFIDENCE = os.getenv("LLM_VERIFY_ON_LOW_CONFIDENCE", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # --- Paperless-NGX ---
 OWNER_ID = 4  # Edgar
@@ -271,27 +296,19 @@ ALLOWED_DOC_TYPES = [
 TAG_WHITELIST = {"kfz", "service", "termin", "aufhebungsvertrag", "ausbildung", "fachinformatiker"}
 
 # --- Tag-Loeschregeln ---
-TAG_DELETE_THRESHOLD = 1      # Tags mit <= X Dokumenten loeschen (ausser Whitelist)
-TAG_ENGLISH_THRESHOLD = 3     # Englische Tags mit <= X Dokumenten loeschen
+TAG_DELETE_THRESHOLD = int(os.getenv("TAG_DELETE_THRESHOLD", "0"))
+TAG_ENGLISH_THRESHOLD = int(os.getenv("TAG_ENGLISH_THRESHOLD", "0"))
 NON_TAXONOMY_DELETE_THRESHOLD = int(os.getenv("NON_TAXONOMY_DELETE_THRESHOLD", "5"))
+DELETE_USED_TAGS = os.getenv("DELETE_USED_TAGS", "0").strip().lower() in ("1", "true", "yes", "on")
 
-# --- Korrespondenten-Gruppen fuer Merge ---
-CORRESPONDENT_GROUPS = {
-    "DRK": ["drk", "deutsches rotes kreuz", "rotes kreuz", "wasserwacht", "blutspende"],
-    "AOK PLUS": ["aok"],
-    "IHK Dresden": ["ihk", "industrie- und handelskammer dresden", "industriekammer dresden", "thresien"],
-    "WBS TRAINING AG": ["wbs training", "wbs training ag"],
-    "msg systems ag": ["msg"],
-    "Amazon": ["amazon"],
-    "Baader Bank": ["baader"],
-    "Apple": ["apple"],
-    "Digistore24": ["digistore"],
-    "CHECK24": ["check24"],
-    "AXA": ["axa"],
-    "Scalable Capital": ["scalable"],
-    "DHL": ["dhl"],
-    "Corporate Benefits": ["corporate benefits"],
-    "1&1": ["1&1", "1und1", "1 & 1"],
+# --- Korrespondenten-Dedupe (generisch, konservativ) ---
+CORRESPONDENT_LEGAL_TOKENS = {
+    "gmbh", "ag", "mbh", "kg", "kgaa", "ug", "eg", "e", "ev", "e.v", "ggmbh",
+    "inc", "ltd", "llc", "corp", "co", "company", "corporation", "sarl", "sa",
+}
+CORRESPONDENT_STOPWORDS = {
+    "der", "die", "das", "und", "im", "in", "am", "an", "auf", "mit", "von", "zu", "zum", "zur",
+    "des", "dem", "den", "for", "of", "the", "via", "team", "support",
 }
 
 # --- Tag-Farbpalette (20 Farben) ---
@@ -319,12 +336,41 @@ MAX_PROMPT_TAG_CHOICES = int(os.getenv("MAX_PROMPT_TAG_CHOICES", "120"))
 ENFORCE_TAG_TAXONOMY = os.getenv("ENFORCE_TAG_TAXONOMY", "1").strip().lower() in ("1", "true", "yes", "on")
 AUTO_CREATE_TAXONOMY_TAGS = os.getenv("AUTO_CREATE_TAXONOMY_TAGS", "0").strip().lower() in ("1", "true", "yes", "on")
 MAX_TOTAL_TAGS = int(os.getenv("MAX_TOTAL_TAGS", "100"))
+KEEP_UNUSED_TAXONOMY_TAGS = os.getenv("KEEP_UNUSED_TAXONOMY_TAGS", "1").strip().lower() in ("1", "true", "yes", "on")
 RECHECK_ALL_DOCS_IN_AUTO = os.getenv("RECHECK_ALL_DOCS_IN_AUTO", "0").strip().lower() in ("1", "true", "yes", "on")
 REVIEW_TAG_NAME = os.getenv("REVIEW_TAG_NAME", "Manuell-Pruefen")
 AUTO_APPLY_REVIEW_TAG = os.getenv("AUTO_APPLY_REVIEW_TAG", "1").strip().lower() in ("1", "true", "yes", "on")
 REVIEW_ON_MEDIUM_CONFIDENCE = os.getenv("REVIEW_ON_MEDIUM_CONFIDENCE", "0").strip().lower() in ("1", "true", "yes", "on")
 USE_ARCHIVE_SERIAL_NUMBER = os.getenv("USE_ARCHIVE_SERIAL_NUMBER", "0").strip().lower() in ("1", "true", "yes", "on")
 CORRESPONDENT_MATCH_THRESHOLD = float(os.getenv("CORRESPONDENT_MATCH_THRESHOLD", "0.86"))
+ALLOW_NEW_CORRESPONDENTS = os.getenv("ALLOW_NEW_CORRESPONDENTS", "0").strip().lower() in ("1", "true", "yes", "on")
+DELETE_UNUSED_CORRESPONDENTS = os.getenv("DELETE_UNUSED_CORRESPONDENTS", "0").strip().lower() in ("1", "true", "yes", "on")
+CORRESPONDENT_MERGE_MIN_GROUP_DOCS = int(os.getenv("CORRESPONDENT_MERGE_MIN_GROUP_DOCS", "2"))
+CORRESPONDENT_MERGE_MIN_NAME_SIMILARITY = float(os.getenv("CORRESPONDENT_MERGE_MIN_NAME_SIMILARITY", "0.96"))
+LEARNING_EXAMPLE_LIMIT = int(os.getenv("LEARNING_EXAMPLE_LIMIT", "3"))
+LEARNING_MAX_EXAMPLES = int(os.getenv("LEARNING_MAX_EXAMPLES", "2000"))
+ENABLE_LEARNING_PRIORS = os.getenv("ENABLE_LEARNING_PRIORS", "1").strip().lower() in ("1", "true", "yes", "on")
+LEARNING_PRIOR_MAX_HINTS = int(os.getenv("LEARNING_PRIOR_MAX_HINTS", "2"))
+LEARNING_PRIOR_MIN_SAMPLES = int(os.getenv("LEARNING_PRIOR_MIN_SAMPLES", "3"))
+LEARNING_PRIOR_MIN_RATIO = float(os.getenv("LEARNING_PRIOR_MIN_RATIO", "0.70"))
+LEARNING_PRIOR_ENABLE_TAG_SUGGESTION = os.getenv("LEARNING_PRIOR_ENABLE_TAG_SUGGESTION", "0").strip().lower() in ("1", "true", "yes", "on")
+LIVE_WATCH_INTERVAL_SEC = int(os.getenv("LIVE_WATCH_INTERVAL_SEC", "45"))
+LIVE_WATCH_CONTEXT_REFRESH_CYCLES = int(os.getenv("LIVE_WATCH_CONTEXT_REFRESH_CYCLES", "5"))
+LIVE_WATCH_COMPACT_FIRST = os.getenv("LIVE_WATCH_COMPACT_FIRST", "1").strip().lower() in ("1", "true", "yes", "on")
+MAX_CONTEXT_EMPLOYER_HINTS = int(os.getenv("MAX_CONTEXT_EMPLOYER_HINTS", "20"))
+WORK_CORR_EMPLOYER_MIN_DOCS = int(os.getenv("WORK_CORR_EMPLOYER_MIN_DOCS", "8"))
+AUTOPILOT_INTERVAL_SEC = int(os.getenv("AUTOPILOT_INTERVAL_SEC", "45"))
+AUTOPILOT_CONTEXT_REFRESH_CYCLES = int(os.getenv("AUTOPILOT_CONTEXT_REFRESH_CYCLES", "5"))
+AUTOPILOT_START_WITH_AUTO_ORGANIZE = os.getenv("AUTOPILOT_START_WITH_AUTO_ORGANIZE", "1").strip().lower() in ("1", "true", "yes", "on")
+AUTOPILOT_RECHECK_ALL_ON_START = os.getenv("AUTOPILOT_RECHECK_ALL_ON_START", "0").strip().lower() in ("1", "true", "yes", "on")
+AUTOPILOT_CLEANUP_EVERY_CYCLES = int(os.getenv("AUTOPILOT_CLEANUP_EVERY_CYCLES", "10"))
+AUTOPILOT_DUPLICATE_SCAN_EVERY_CYCLES = int(os.getenv("AUTOPILOT_DUPLICATE_SCAN_EVERY_CYCLES", "0"))
+AUTOPILOT_MAX_NEW_DOCS_PER_CYCLE = int(os.getenv("AUTOPILOT_MAX_NEW_DOCS_PER_CYCLE", "25"))
+WATCH_RECONNECT_ERROR_THRESHOLD = int(os.getenv("WATCH_RECONNECT_ERROR_THRESHOLD", "3"))
+WATCH_ERROR_BACKOFF_BASE_SEC = int(os.getenv("WATCH_ERROR_BACKOFF_BASE_SEC", "10"))
+WATCH_ERROR_BACKOFF_MAX_SEC = int(os.getenv("WATCH_ERROR_BACKOFF_MAX_SEC", "180"))
+SKIP_RECENT_LLM_ERRORS_MINUTES = int(os.getenv("SKIP_RECENT_LLM_ERRORS_MINUTES", "240"))
+SKIP_RECENT_LLM_ERRORS_THRESHOLD = int(os.getenv("SKIP_RECENT_LLM_ERRORS_THRESHOLD", "1"))
 
 # --- Optional web hints for unknown brands/entities ---
 ENABLE_WEB_HINTS = os.getenv("ENABLE_WEB_HINTS", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -399,6 +445,23 @@ VENDOR_GUARDRAILS = {
 
 PRIVATE_VEHICLE_HINTS = ["vw polo", "volkswagen polo", "polo", "golf polo"]
 COMPANY_VEHICLE_HINTS = ["toyota"]
+HEALTH_HINTS = [
+    "allergie", "allergen", "arzt", "klinikum", "testzentrum", "sars-cov-2", "covid",
+    "krankenkasse", "arbeitsunfaehigkeit", "arbeitsunfÃ¤higkeit", "krankschreibung", "anamnese",
+]
+SCHOOL_HINTS = [
+    "berufliches schulzentrum", "oberschule", "abschlusszeugnis", "zeugnis", "pruefung",
+    "prÃ¼fung", "fahrschule", "fahrerlaubnispruefung", "fahrerlaubnisprÃ¼fung", "anmeldebestaetigung",
+    "anmeldebestÃ¤tigung",
+]
+EVENT_TICKET_HINTS = [
+    "event ticket", "openair", "konzert", "festival", "ticket.io", "eintrittskarte",
+    "party", "birthday party", "club", "veranstaltung",
+]
+TRANSPORT_TICKET_HINTS = [
+    "fahrkarte", "deutschlandticket", "deutsche bahn", "bahn", "verkehrsverbund", "omnibus", "bus",
+    "zugticket", "bahnticket",
+]
 
 
 @dataclass
@@ -408,15 +471,492 @@ class DecisionContext:
     provider_names: set[str] = field(default_factory=set)          # normalized keys
     top_work_paths: list[str] = field(default_factory=list)
     top_private_paths: list[str] = field(default_factory=list)
+    profile_employment_lines: list[str] = field(default_factory=list)
+    profile_private_vehicles: list[str] = field(default_factory=list)
+    profile_company_vehicles: list[str] = field(default_factory=list)
+    profile_context_text: str = ""
     notes: list[str] = field(default_factory=list)
+
+
+def _safe_iso_date(value: str) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 10:
+        candidate = text[:10]
+        try:
+            datetime.strptime(candidate, "%Y-%m-%d")
+            return candidate
+        except ValueError:
+            return ""
+    return ""
+
+
+class LearningProfile:
+    """Persistent lightweight learning profile for jobs/vehicles and stable context."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        self.data: dict = {}
+        self.load()
+
+    def _default_data(self) -> dict:
+        return {
+            "owner": "Edgar Richter",
+            "jobs": [
+                {"company": "msg systems ag", "start": "2022-01-01", "end": "2025-07-31", "source": "seed"},
+                {"company": "WBS TRAINING AG", "start": "2025-08-01", "end": "", "source": "seed"},
+            ],
+            "vehicles": {
+                "private": ["VW Polo"],
+                "company": ["Toyota"],
+            },
+            "notes": ["DRK-Mitglied", "AOK PLUS"],
+            "last_updated": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict):
+                    self.data = raw
+                else:
+                    self.data = self._default_data()
+            except Exception:
+                self.data = self._default_data()
+        else:
+            self.data = self._default_data()
+            self.save()
+
+        self.data.setdefault("jobs", [])
+        self.data.setdefault("vehicles", {})
+        self.data["vehicles"].setdefault("private", [])
+        self.data["vehicles"].setdefault("company", [])
+        self.data.setdefault("notes", [])
+        self.data.setdefault("owner", "Edgar Richter")
+        self.data.setdefault("last_updated", datetime.now().isoformat(timespec="seconds"))
+
+    def save(self):
+        with self._lock:
+            self.data["last_updated"] = datetime.now().isoformat(timespec="seconds")
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
+
+    def employer_names(self) -> set[str]:
+        names = set()
+        for job in self.data.get("jobs", []):
+            company = _normalize_text(str(job.get("company", "")))
+            if not company:
+                continue
+            names.add(_normalize_tag_name(company))
+        return names
+
+    def private_vehicle_hints(self) -> list[str]:
+        hints = list(PRIVATE_VEHICLE_HINTS)
+        hints.extend(self.data.get("vehicles", {}).get("private", []))
+        return list(dict.fromkeys(_normalize_tag_name(h) for h in hints if _normalize_text(h)))
+
+    def company_vehicle_hints(self) -> list[str]:
+        hints = list(COMPANY_VEHICLE_HINTS)
+        hints.extend(self.data.get("vehicles", {}).get("company", []))
+        return list(dict.fromkeys(_normalize_tag_name(h) for h in hints if _normalize_text(h)))
+
+    def employment_lines(self) -> list[str]:
+        jobs = self.data.get("jobs", [])
+        normalized = []
+        for job in jobs:
+            company = _normalize_text(str(job.get("company", "")))
+            if not company:
+                continue
+            start = _safe_iso_date(str(job.get("start", "")))
+            end = _safe_iso_date(str(job.get("end", "")))
+            if start and end:
+                line = f"{start} bis {end}: {company}"
+            elif start:
+                line = f"seit {start}: {company}"
+            else:
+                line = company
+            normalized.append((start or "0000-00-00", line))
+        normalized.sort(key=lambda x: x[0], reverse=True)
+        return [line for _, line in normalized[:10]]
+
+    def prompt_context_text(self) -> str:
+        owner = _normalize_text(str(self.data.get("owner", "Edgar Richter")))
+        jobs = "; ".join(self.employment_lines()) or "keine bekannten Beschaeftigungen"
+        private_vehicles = ", ".join(self.data.get("vehicles", {}).get("private", [])) or "keine"
+        company_vehicles = ", ".join(self.data.get("vehicles", {}).get("company", [])) or "keine"
+        notes = ", ".join(_normalize_text(n) for n in self.data.get("notes", []) if _normalize_text(n)) or "keine"
+        if len(notes) > 240:
+            notes = notes[:240] + "..."
+        return (
+            f"Person: {owner}.\n"
+            f"Beschaeftigungsverlauf: {jobs}.\n"
+            f"Privatfahrzeuge: {private_vehicles}.\n"
+            f"Firmenfahrzeuge: {company_vehicles}.\n"
+            f"Weitere Hinweise: {notes}."
+        )
+
+    @staticmethod
+    def _extract_vehicle_candidates(text: str) -> list[str]:
+        if not text:
+            return []
+        cleaned = _strip_diacritics(text.lower())
+        out = []
+        has_model_brand = set()
+
+        pattern_with_model = r"\b(toyota|volkswagen|vw|audi|bmw|mercedes|skoda|ford|renault|opel|seat|tesla|hyundai|kia)\s+([a-z0-9\-]{2,20})\b"
+        for m in re.finditer(pattern_with_model, cleaned):
+            brand = m.group(1)
+            model = m.group(2)
+            if brand == "vw":
+                brand = "volkswagen"
+            has_model_brand.add(brand)
+            candidate = _normalize_text(f"{brand} {model}").title()
+            if candidate and candidate not in out:
+                out.append(candidate)
+
+        pattern_brand_only = r"\b(toyota|volkswagen|vw|audi|bmw|mercedes|skoda|ford|renault|opel|seat|tesla|hyundai|kia)\b"
+        for m in re.finditer(pattern_brand_only, cleaned):
+            brand = m.group(1)
+            if brand == "vw":
+                brand = "volkswagen"
+            if brand in has_model_brand:
+                continue
+            candidate = _normalize_text(brand).title()
+            if candidate and candidate not in out:
+                out.append(candidate)
+        return out[:8]
+
+    def _learn_job(self, company: str, start_date: str):
+        company_clean = _normalize_text(company)
+        if not company_clean:
+            return
+        jobs = self.data.get("jobs", [])
+        wanted_norm = _normalize_tag_name(company_clean)
+        existing = None
+        for job in jobs:
+            if _normalize_tag_name(str(job.get("company", ""))) == wanted_norm:
+                existing = job
+                break
+
+        if existing:
+            if start_date:
+                old_start = _safe_iso_date(str(existing.get("start", "")))
+                if not old_start or start_date < old_start:
+                    existing["start"] = start_date
+            if not existing.get("company"):
+                existing["company"] = company_clean
+            return
+
+        jobs.append({"company": company_clean, "start": start_date, "end": "", "source": "auto"})
+        self.data["jobs"] = jobs
+
+        # If a new company starts, close the previously open job (if present).
+        if start_date:
+            new_start = datetime.strptime(start_date, "%Y-%m-%d")
+            for job in jobs:
+                same = _normalize_tag_name(str(job.get("company", ""))) == wanted_norm
+                if same:
+                    continue
+                old_end = _safe_iso_date(str(job.get("end", "")))
+                old_start = _safe_iso_date(str(job.get("start", "")))
+                if old_end or not old_start:
+                    continue
+                try:
+                    old_start_dt = datetime.strptime(old_start, "%Y-%m-%d")
+                except ValueError:
+                    continue
+                if old_start_dt <= new_start:
+                    job["end"] = (new_start - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        if len(jobs) > 25:
+            jobs.sort(
+                key=lambda j: _safe_iso_date(str(j.get("start", ""))) or "0000-00-00",
+                reverse=True,
+            )
+            self.data["jobs"] = jobs[:25]
+
+    def _learn_vehicle(self, candidates: list[str], company_vehicle: bool):
+        if not candidates:
+            return
+        vehicle_key = "company" if company_vehicle else "private"
+        target = self.data.setdefault("vehicles", {}).setdefault(vehicle_key, [])
+        known_norm = {_normalize_tag_name(v) for v in target}
+        for cand in candidates:
+            if _normalize_tag_name(cand) in known_norm:
+                continue
+            target.append(cand)
+            known_norm.add(_normalize_tag_name(cand))
+
+    def learn_from_document(self, document: dict, suggestion: dict):
+        text = " ".join([
+            str(document.get("title", "")),
+            str(document.get("original_file_name", "")),
+            str(document.get("content", ""))[:6000],
+            str(suggestion.get("title", "")),
+            str(suggestion.get("correspondent", "")),
+            str(suggestion.get("storage_path", "")),
+            " ".join(str(t) for t in (suggestion.get("tags") or [])),
+        ]).lower()
+
+        created = _safe_iso_date(str(document.get("created", "")))
+        corr = _normalize_text(str(suggestion.get("correspondent", "")))
+        path_lower = _normalize_text(str(suggestion.get("storage_path", ""))).lower()
+        doc_type_lower = _normalize_text(str(suggestion.get("document_type", ""))).lower()
+        tags_lower = {_normalize_tag_name(str(t)) for t in (suggestion.get("tags") or [])}
+
+        employment_keywords = (
+            "arbeitsvertrag",
+            "arbeitsverhaltnis",
+            "arbeitsverhältnis",
+            "eintritt",
+            "anstellung",
+            "arbeitsbeginn",
+            "gehaltsabrechnung",
+        )
+        corr_norm = _normalize_tag_name(corr)
+        known_employer = corr_norm in EMPLOYER_HINTS or corr_norm in self.employer_names()
+        explicit_employment = any(k in _strip_diacritics(text) for k in employment_keywords)
+        strong_doc_type = doc_type_lower in {"vertrag", "gehaltsabrechnung", "zeugnis"}
+        has_work_tag = ("arbeit" in tags_lower or "wbs" in tags_lower or "msg" in tags_lower)
+        if corr and (
+            (known_employer and path_lower.startswith("arbeit/") and (strong_doc_type or has_work_tag))
+            or (explicit_employment and (strong_doc_type or path_lower.startswith("arbeit/")))
+        ):
+            self._learn_job(corr, created)
+
+        vehicle_keywords = ("fahrzeug", "firmenwagen", "dienstwagen", "kfz", "zulassungsbescheinigung", "kennzeichen", "leasing")
+        if any(k in _strip_diacritics(text) for k in vehicle_keywords):
+            candidates = self._extract_vehicle_candidates(text)
+            if candidates:
+                company_signal = path_lower.startswith("arbeit/") or ("firmenwagen" in text) or ("dienstwagen" in text)
+                private_signal = ("privatwagen" in text) or ("kfz-versicherung" in text)
+                if company_signal and not private_signal:
+                    self._learn_vehicle(candidates, company_vehicle=True)
+                elif private_signal and not company_signal:
+                    self._learn_vehicle(candidates, company_vehicle=False)
+                else:
+                    self._learn_vehicle(candidates, company_vehicle=path_lower.startswith("arbeit/"))
+
+
+class LearningExamples:
+    """Persistent few-shot memory for small models (JSONL)."""
+
+    def __init__(self, path: str, max_examples: int = LEARNING_MAX_EXAMPLES):
+        self.path = path
+        self.max_examples = max(100, int(max_examples or 100))
+        self._lock = threading.Lock()
+        self._examples: list[dict] = []
+        self.load()
+
+    def load(self):
+        self._examples = []
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(row, dict):
+                        self._examples.append(row)
+            if len(self._examples) > self.max_examples:
+                self._examples = self._examples[-self.max_examples:]
+        except Exception:
+            self._examples = []
+
+    @staticmethod
+    def _tokens(text: str) -> set[str]:
+        words = re.findall(r"[a-zA-Z0-9]{3,}", _strip_diacritics((text or "").lower()))
+        stop = {"und", "der", "die", "das", "von", "mit", "fuer", "for", "the", "and", "ein", "eine"}
+        return {w for w in words if w not in stop}
+
+    def append(self, document: dict, suggestion: dict):
+        row = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "doc_title": _normalize_text(str(document.get("title", ""))),
+            "filename": _normalize_text(str(document.get("original_file_name", ""))),
+            "correspondent": _normalize_text(str(suggestion.get("correspondent", ""))),
+            "document_type": _normalize_text(str(suggestion.get("document_type", ""))),
+            "storage_path": _normalize_text(str(suggestion.get("storage_path", ""))),
+            "tags": [_normalize_text(str(t)) for t in (suggestion.get("tags") or []) if _normalize_text(str(t))],
+        }
+        if not row["correspondent"] and not row["document_type"] and not row["storage_path"]:
+            return
+
+        with self._lock:
+            self._examples.append(row)
+            if len(self._examples) > self.max_examples:
+                self._examples = self._examples[-self.max_examples:]
+            with open(self.path, "w", encoding="utf-8") as f:
+                for entry in self._examples:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def select(self, document: dict, limit: int = LEARNING_EXAMPLE_LIMIT) -> list[dict]:
+        if not self._examples:
+            return []
+        query = " ".join([
+            str(document.get("title", "")),
+            str(document.get("original_file_name", "")),
+            str(document.get("content", ""))[:1200],
+        ])
+        q_tokens = self._tokens(query)
+        if not q_tokens:
+            return []
+
+        scored = []
+        for entry in self._examples[-500:]:
+            text = " ".join([
+                str(entry.get("doc_title", "")),
+                str(entry.get("filename", "")),
+                str(entry.get("correspondent", "")),
+                str(entry.get("document_type", "")),
+                str(entry.get("storage_path", "")),
+                " ".join(entry.get("tags") or []),
+            ])
+            e_tokens = self._tokens(text)
+            overlap = len(q_tokens & e_tokens)
+            if overlap <= 0:
+                continue
+            scored.append((overlap, entry))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        unique = []
+        seen_keys = set()
+        for _, entry in scored:
+            key = (
+                entry.get("correspondent", ""),
+                entry.get("document_type", ""),
+                entry.get("storage_path", ""),
+                tuple(entry.get("tags") or []),
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            unique.append(entry)
+            if len(unique) >= max(0, int(limit)):
+                break
+        return unique
+
+    def _build_correspondent_profiles(self) -> list[dict]:
+        grouped: dict[str, dict] = {}
+        for entry in self._examples:
+            corr = _normalize_text(str(entry.get("correspondent", "")))
+            if not corr:
+                continue
+            key = _normalize_tag_name(corr)
+            if not key:
+                continue
+            row = grouped.setdefault(
+                key,
+                {
+                    "correspondent": corr,
+                    "count": 0,
+                    "doc_types": defaultdict(int),
+                    "paths": defaultdict(int),
+                    "tags": defaultdict(int),
+                },
+            )
+            row["count"] += 1
+            doc_type = _normalize_text(str(entry.get("document_type", "")))
+            path = _normalize_text(str(entry.get("storage_path", "")))
+            if doc_type:
+                row["doc_types"][doc_type] += 1
+            if path:
+                row["paths"][path] += 1
+            for t in entry.get("tags") or []:
+                tag_name = _normalize_text(str(t))
+                if tag_name:
+                    row["tags"][tag_name] += 1
+
+        profiles = []
+        for row in grouped.values():
+            total = max(1, int(row["count"]))
+            top_doc_type, top_doc_type_count = ("", 0)
+            top_path, top_path_count = ("", 0)
+            if row["doc_types"]:
+                top_doc_type, top_doc_type_count = max(row["doc_types"].items(), key=lambda x: x[1])
+            if row["paths"]:
+                top_path, top_path_count = max(row["paths"].items(), key=lambda x: x[1])
+            top_tags_sorted = sorted(row["tags"].items(), key=lambda x: x[1], reverse=True)[:4]
+            tag_ratios = {name: (count / total) for name, count in top_tags_sorted}
+            profiles.append(
+                {
+                    "correspondent": row["correspondent"],
+                    "count": total,
+                    "top_document_type": top_doc_type,
+                    "document_type_ratio": (top_doc_type_count / total) if top_doc_type else 0.0,
+                    "top_storage_path": top_path,
+                    "storage_path_ratio": (top_path_count / total) if top_path else 0.0,
+                    "top_tags": [name for name, _ in top_tags_sorted],
+                    "tag_ratios": tag_ratios,
+                }
+            )
+        return profiles
+
+    def routing_hints_for_document(self, document: dict, limit: int = LEARNING_PRIOR_MAX_HINTS) -> list[dict]:
+        """
+        Learns stable routing priors from confirmed examples.
+        Example: many docs from "Scalable Capital" -> likely Kontoauszug + Finanzen/Bank.
+        """
+        if not ENABLE_LEARNING_PRIORS:
+            return []
+        if not self._examples:
+            return []
+
+        query = " ".join([
+            str(document.get("title", "")),
+            str(document.get("original_file_name", "")),
+            str(document.get("content", ""))[:2200],
+        ])
+        query_norm = _normalize_tag_name(query)
+        q_tokens = self._tokens(query)
+        if not query_norm and not q_tokens:
+            return []
+
+        profiles = self._build_correspondent_profiles()
+        scored = []
+        for profile in profiles:
+            count = int(profile.get("count", 0) or 0)
+            if count < LEARNING_PRIOR_MIN_SAMPLES:
+                continue
+            corr = str(profile.get("correspondent", ""))
+            corr_norm = _normalize_tag_name(corr)
+            corr_tokens = self._tokens(corr)
+            overlap = len(q_tokens & corr_tokens)
+            exact = 1 if (corr_norm and corr_norm in query_norm) else 0
+            if overlap <= 0 and exact == 0:
+                continue
+            score = float(overlap + (3 * exact)) + min(count, 20) * 0.08
+            scored.append((score, profile))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        unique = []
+        seen = set()
+        for _, profile in scored:
+            corr = str(profile.get("correspondent", ""))
+            corr_norm = _normalize_tag_name(corr)
+            if not corr_norm or corr_norm in seen:
+                continue
+            seen.add(corr_norm)
+            unique.append(profile)
+            if len(unique) >= max(0, int(limit)):
+                break
+        return unique
 
 # --- German-Character Detection ---
 GERMAN_CHARS_RE = re.compile(r'[aeoeueAeOeUess]')
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # PaperlessClient
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class PaperlessClient:
     """Vereinter Client fuer die Paperless-NGX REST API."""
@@ -437,8 +977,26 @@ class PaperlessClient:
         url = f"{self.url}/api/{endpoint}/?page_size=100"
         while url:
             url = url.replace("http://", "https://")
-            resp = self.session.get(url, timeout=30)
-            resp.raise_for_status()
+            last_exc = None
+            resp = None
+            for attempt in range(MAX_RETRIES):
+                try:
+                    resp = self.session.get(url, timeout=30)
+                    resp.raise_for_status()
+                    last_exc = None
+                    break
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as exc:
+                    last_exc = exc
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(1.5 * (attempt + 1))
+                        continue
+                    raise
+                except requests.exceptions.RequestException:
+                    raise
+            if resp is None:
+                if last_exc:
+                    raise last_exc
+                raise RuntimeError(f"GET fehlgeschlagen: {url}")
             data = resp.json()
             results.extend(data.get("results", []))
             url = data.get("next")
@@ -461,9 +1019,24 @@ class PaperlessClient:
         return self._get_all("documents")
 
     def get_document(self, doc_id: int) -> dict:
-        resp = self.session.get(f"{self.url}/api/documents/{doc_id}/", timeout=30)
-        resp.raise_for_status()
-        return resp.json()
+        url = f"{self.url}/api/documents/{doc_id}/"
+        last_exc = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = self.session.get(url, timeout=30)
+                resp.raise_for_status()
+                return resp.json()
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as exc:
+                last_exc = exc
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise
+            except requests.exceptions.RequestException:
+                raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"Dokument konnte nicht geladen werden: {doc_id}")
 
     # --- Schreiben ---
     def _with_permissions(self, data: dict) -> dict:
@@ -610,9 +1183,9 @@ class PaperlessClient:
         return deleted
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # LocalLLMAnalyzer
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def _normalize_text(value: str) -> str:
     return " ".join((value or "").strip().split())
@@ -820,7 +1393,8 @@ def _fetch_entity_web_hint(entity: str) -> str:
     return result
 
 
-def build_decision_context(documents: list, correspondents: list, storage_paths: list) -> DecisionContext:
+def build_decision_context(documents: list, correspondents: list, storage_paths: list,
+                           learning_profile: LearningProfile | None = None) -> DecisionContext:
     """
     Phase 1: collect current system data before making document decisions.
     Learns likely employers/vendors/paths from existing assignments.
@@ -852,8 +1426,14 @@ def build_decision_context(documents: list, correspondents: list, storage_paths:
                 provider_counts[vendor_key] += 1
 
     context.employer_names.update(EMPLOYER_HINTS)
-    for norm_name, count in work_corr_counts.items():
-        if count >= 2:
+    if learning_profile:
+        context.employer_names.update(learning_profile.employer_names())
+        context.profile_employment_lines = learning_profile.employment_lines()
+        context.profile_private_vehicles = learning_profile.private_vehicle_hints()
+        context.profile_company_vehicles = learning_profile.company_vehicle_hints()
+        context.profile_context_text = learning_profile.prompt_context_text()
+    for norm_name, count in sorted(work_corr_counts.items(), key=lambda x: x[1], reverse=True):
+        if count >= WORK_CORR_EMPLOYER_MIN_DOCS:
             context.employer_names.add(norm_name)
 
     for vendor_key in VENDOR_GUARDRAILS:
@@ -867,6 +1447,12 @@ def build_decision_context(documents: list, correspondents: list, storage_paths:
     context.notes.append(f"docs={len(documents)}")
     context.notes.append(f"employers={len(context.employer_names)}")
     context.notes.append(f"providers={len(context.provider_names)}")
+    if context.profile_employment_lines:
+        context.notes.append(f"profile_jobs={len(context.profile_employment_lines)}")
+    if context.profile_private_vehicles or context.profile_company_vehicles:
+        context.notes.append(
+            f"profile_vehicles={len(context.profile_private_vehicles)}+{len(context.profile_company_vehicles)}"
+        )
     return context
 
 
@@ -933,8 +1519,16 @@ def _apply_vehicle_guardrails(document: dict, suggestion: dict, storage_paths: l
     path_value = _normalize_text(str(suggestion.get("storage_path", "")))
     path_lower = path_value.lower()
 
-    has_private_vehicle = _contains_any_hint(text, PRIVATE_VEHICLE_HINTS)
-    has_company_vehicle = _contains_any_hint(text, COMPANY_VEHICLE_HINTS)
+    private_hints = PRIVATE_VEHICLE_HINTS
+    company_hints = COMPANY_VEHICLE_HINTS
+    if decision_context:
+        if decision_context.profile_private_vehicles:
+            private_hints = decision_context.profile_private_vehicles
+        if decision_context.profile_company_vehicles:
+            company_hints = decision_context.profile_company_vehicles
+
+    has_private_vehicle = _contains_any_hint(text, private_hints)
+    has_company_vehicle = _contains_any_hint(text, company_hints)
 
     if has_private_vehicle and path_lower.startswith("arbeit/"):
         safe_private_path = _pick_existing_storage_path(
@@ -1055,6 +1649,144 @@ def _apply_vendor_guardrails(document: dict, suggestion: dict, correspondents: l
     web_provider = _fetch_entity_web_hint(guard["correspondent"])
     if web_provider:
         suggestion["reasoning"] = f"{suggestion.get('reasoning', '')} | Web: {web_provider}".strip(" |")
+    return corrections
+
+
+def _apply_topic_guardrails(document: dict, suggestion: dict, correspondents: list, storage_paths: list,
+                            decision_context: DecisionContext | None = None) -> list[str]:
+    """Generic content guardrails for health/school/ticket documents."""
+    corrections = []
+    current_corr_name = _get_correspondent_name_by_id(correspondents, document.get("correspondent"))
+    suggested_corr = _normalize_tag_name(str(suggestion.get("correspondent", "")))
+    current_corr = _normalize_tag_name(current_corr_name)
+    employer_hints = _effective_employer_hints(decision_context)
+
+    text = " ".join([
+        str(document.get("title", "")),
+        str(document.get("original_file_name", "")),
+        str(document.get("content", ""))[:3500],
+        str(suggestion.get("title", "")),
+        str(suggestion.get("reasoning", "")),
+    ]).lower()
+    path_value = _normalize_text(str(suggestion.get("storage_path", "")))
+    path_lower = path_value.lower()
+
+    is_health = _contains_any_hint(text, HEALTH_HINTS)
+    is_school = _contains_any_hint(text, SCHOOL_HINTS)
+    is_event_ticket = _contains_any_hint(text, EVENT_TICKET_HINTS)
+    is_transport_ticket = _contains_any_hint(text, TRANSPORT_TICKET_HINTS) and not is_event_ticket
+
+    if is_health:
+        safe_health_path = _pick_existing_storage_path(
+            storage_paths,
+            ["Gesundheit/Arzt", "Gesundheit/Krankenkasse", "Gesundheit", "Korrespondenz/Allgemein"],
+        )
+        if safe_health_path and (not path_lower or path_lower.startswith("arbeit/") or path_lower.startswith("korrespondenz/")):
+            suggestion["storage_path"] = safe_health_path
+            corrections.append(f"storage_path->{safe_health_path} (health)")
+        if suggested_corr in employer_hints and current_corr_name and current_corr not in employer_hints:
+            suggestion["correspondent"] = current_corr_name
+            corrections.append(f"correspondent->{current_corr_name} (health context)")
+
+    if is_school:
+        safe_school_path = _pick_existing_storage_path(
+            storage_paths,
+            ["Ausbildung/Berufsschule", "Ausbildung/Schule", "Ausbildung", "Korrespondenz/Allgemein"],
+        )
+        if safe_school_path and (not path_lower or path_lower.startswith("arbeit/") or path_lower.startswith("korrespondenz/")):
+            suggestion["storage_path"] = safe_school_path
+            corrections.append(f"storage_path->{safe_school_path} (school)")
+        if suggested_corr in employer_hints and current_corr_name and current_corr not in employer_hints:
+            suggestion["correspondent"] = current_corr_name
+            corrections.append(f"correspondent->{current_corr_name} (school context)")
+
+    if is_event_ticket:
+        safe_event_path = _pick_existing_storage_path(
+            storage_paths,
+            ["Freizeit/Events", "Freizeit", "Freizeit/Reisen", "Korrespondenz/Allgemein"],
+        )
+        if safe_event_path and (not path_lower or path_lower.startswith("korrespondenz/")):
+            suggestion["storage_path"] = safe_event_path
+            corrections.append(f"storage_path->{safe_event_path} (event ticket)")
+
+    if is_transport_ticket:
+        safe_transport_path = _pick_existing_storage_path(
+            storage_paths,
+            ["Finanzen/Rechnungen", "Finanzen", "Freizeit/Reisen", "Mobilitaet", "Korrespondenz/Allgemein"],
+        )
+        if safe_transport_path and (not path_lower or path_lower.startswith("korrespondenz/")):
+            suggestion["storage_path"] = safe_transport_path
+            corrections.append(f"storage_path->{safe_transport_path} (transport ticket)")
+
+    return corrections
+
+
+def _apply_learning_guardrails(suggestion: dict, storage_paths: list, learning_hints: list[dict] | None) -> list[str]:
+    """
+    Apply conservative priors learned from confirmed examples.
+    Only nudges generic/empty outputs, does not hard-overwrite specific good predictions.
+    """
+    corrections = []
+    if not ENABLE_LEARNING_PRIORS or not learning_hints:
+        return corrections
+
+    best = learning_hints[0]
+    min_ratio = max(0.5, min(0.95, LEARNING_PRIOR_MIN_RATIO))
+    top_corr = _normalize_text(str(best.get("correspondent", "")))
+    top_type = _normalize_text(str(best.get("top_document_type", "")))
+    top_path = _normalize_text(str(best.get("top_storage_path", "")))
+    type_ratio = float(best.get("document_type_ratio", 0.0) or 0.0)
+    path_ratio = float(best.get("storage_path_ratio", 0.0) or 0.0)
+    top_tags = [str(t) for t in (best.get("top_tags") or []) if _normalize_text(str(t))]
+    tag_ratios = best.get("tag_ratios") or {}
+
+    corr_now = _normalize_text(str(suggestion.get("correspondent", "")))
+    type_now = _normalize_text(str(suggestion.get("document_type", "")))
+    path_now = _normalize_text(str(suggestion.get("storage_path", "")))
+
+    if not corr_now and top_corr:
+        suggestion["correspondent"] = top_corr
+        corrections.append(f"correspondent->{top_corr} (learning prior)")
+
+    if top_type and type_ratio >= min_ratio and (not type_now or type_now.lower() == "information"):
+        suggestion["document_type"] = top_type
+        corrections.append(f"document_type->{top_type} (learning prior {type_ratio:.0%})")
+
+    if top_path and path_ratio >= min_ratio:
+        path_is_generic = (not path_now) or path_now.lower().startswith("korrespondenz/allgemein")
+        if path_is_generic:
+            safe_path = _pick_existing_storage_path(storage_paths, [top_path])
+            if safe_path:
+                suggestion["storage_path"] = safe_path
+                corrections.append(f"storage_path->{safe_path} (learning prior {path_ratio:.0%})")
+
+    if LEARNING_PRIOR_ENABLE_TAG_SUGGESTION:
+        tags_now = [_normalize_text(str(t)) for t in (suggestion.get("tags") or []) if _normalize_text(str(t))]
+        tags_now_norm = {_normalize_tag_name(t) for t in tags_now}
+        blocked_norm = {
+            _normalize_tag_name(REVIEW_TAG_NAME),
+            _normalize_tag_name("Duplikat"),
+            _normalize_tag_name("Auto"),
+        }
+        added_tags = 0
+        for tag in top_tags:
+            if len(tags_now) >= MAX_TAGS_PER_DOC:
+                break
+            ratio = float(tag_ratios.get(tag, 0.0) or 0.0)
+            if ratio < max(0.55, min_ratio - 0.1):
+                continue
+            norm = _normalize_tag_name(tag)
+            if not norm or norm in tags_now_norm or norm in blocked_norm:
+                continue
+            tags_now.append(tag)
+            tags_now_norm.add(norm)
+            added_tags += 1
+            if added_tags >= 1:
+                break
+        if added_tags:
+            suggestion["tags"] = tags_now
+            corrections.append(f"tags+{added_tags} (learning prior)")
+
     return corrections
 
 
@@ -1305,7 +2037,7 @@ def _apply_update_with_fallbacks(paperless: PaperlessClient, doc_id: int, update
 
 
 class LocalLLMAnalyzer:
-    """Analysiert Dokumente mit lokalem LLM via LM Studio."""
+    """Analysiert Dokumente mit lokalem LLM-Endpunkt."""
 
     def __init__(self, url: str = LLM_URL, model: str = LLM_MODEL):
         self.url = self._normalize_url(url)
@@ -1379,7 +2111,7 @@ class LocalLLMAnalyzer:
         return unique[0]
 
     def verify_connection(self) -> bool:
-        """Prueft ob LM Studio erreichbar ist."""
+        """Prueft ob der konfigurierte LLM-Server erreichbar ist."""
         log.info(f"Teste LLM-Verbindung: {self.url}")
         headers = self._auth_headers()
         try:
@@ -1411,7 +2143,7 @@ class LocalLLMAnalyzer:
                 return True
         except requests.exceptions.RequestException:
             pass
-        log.error(f"LM Studio nicht erreichbar! ({self.url})")
+        log.error(f"LLM-Server nicht erreichbar! ({self.url})")
         console.print("[yellow]Bitte LLM-Server starten und Modell laden.[/yellow]")
         return False
 
@@ -1433,17 +2165,30 @@ class LocalLLMAnalyzer:
     def analyze(self, document: dict, existing_tags: list,
                 existing_correspondents: list, existing_types: list,
                 existing_paths: list, taxonomy: TagTaxonomy | None = None,
-                decision_context: DecisionContext | None = None) -> dict:
+                decision_context: DecisionContext | None = None,
+                few_shot_examples: list[dict] | None = None,
+                learning_hints: list[dict] | None = None,
+                compact_mode: bool = False,
+                read_timeout_override: int | None = None) -> dict:
         """Analysiert ein Dokument und gibt Organisationsvorschlag zurueck."""
 
         # Top-Korrespondenten nach Dokumentanzahl (Token sparen)
         top_corrs = sorted(existing_correspondents, key=lambda c: c.get("document_count", 0), reverse=True)
-        corr_names = [c["name"] for c in top_corrs[:50]]
+        max_corr_choices = 12 if compact_mode else 35
+        corr_names = [c["name"] for c in top_corrs[:max_corr_choices]]
         if taxonomy and ENFORCE_TAG_TAXONOMY and taxonomy.canonical_tags:
-            tag_choices = taxonomy.prompt_tags(MAX_PROMPT_TAG_CHOICES)
+            if compact_mode:
+                max_tag_choices = max(8, min(MAX_PROMPT_TAG_CHOICES, LLM_COMPACT_PROMPT_MAX_TAGS))
+            else:
+                max_tag_choices = min(MAX_PROMPT_TAG_CHOICES, 90)
+            tag_choices = taxonomy.prompt_tags(max_tag_choices)
         else:
             top_tags = sorted(existing_tags, key=lambda t: t.get("document_count", 0), reverse=True)
-            tag_choices = [t["name"] for t in top_tags[:MAX_PROMPT_TAG_CHOICES]]
+            if compact_mode:
+                max_tag_choices = max(8, min(MAX_PROMPT_TAG_CHOICES, LLM_COMPACT_PROMPT_MAX_TAGS))
+            else:
+                max_tag_choices = min(MAX_PROMPT_TAG_CHOICES, 90)
+            tag_choices = [t["name"] for t in top_tags[:max_tag_choices]]
 
         current_tags = [
             t["name"] for t in existing_tags
@@ -1462,26 +2207,103 @@ class LocalLLMAnalyzer:
         # Token-effizient: Kurze Dokumente komplett, lange nur Anfang
         content = document.get("content") or ""
         content_len = len(content)
-        if content_len > 5000:
-            content_preview = content[:1500] + f"\n[...{content_len} Zeichen insgesamt, Rest abgeschnitten...]"
-        elif content_len > 2000:
-            content_preview = content[:2000]
+        if compact_mode:
+            if content_len > 1200:
+                content_preview = content[:500] + f"\n[...{content_len} Zeichen insgesamt, Kompaktmodus...]"
+            else:
+                content_preview = content[:500]
         else:
-            content_preview = content
+            if content_len > 5000:
+                content_preview = content[:1200] + f"\n[...{content_len} Zeichen insgesamt, Rest abgeschnitten...]"
+            elif content_len > 2000:
+                content_preview = content[:1200]
+            else:
+                content_preview = content
 
         brand_hint = _get_brand_hint(f"{document.get('title', '')} {document.get('original_file_name', '')} {content_preview[:1000]}")
-        web_hint_primary = _fetch_web_hint(document.get("title", ""), content_preview) if ENABLE_WEB_HINTS else ""
-        web_hint_entities = _collect_web_entity_hints(document, current_corr=current_corr)
+        web_hint_primary = _fetch_web_hint(document.get("title", ""), content_preview) if (ENABLE_WEB_HINTS and not compact_mode) else ""
+        web_hint_entities = _collect_web_entity_hints(document, current_corr=current_corr) if (ENABLE_WEB_HINTS and not compact_mode) else ""
         web_hint = " | ".join([h for h in [web_hint_primary, web_hint_entities] if h])
 
-        employers_info = ", ".join(sorted(decision_context.employer_names)) if decision_context else "keine"
-        providers_info = ", ".join(sorted(decision_context.provider_names)) if decision_context else "keine"
+        if decision_context:
+            employer_list = sorted(decision_context.employer_names)[:max(1, MAX_CONTEXT_EMPLOYER_HINTS)]
+            provider_list = sorted(decision_context.provider_names)[:10]
+            employers_info = ", ".join(employer_list) if employer_list else "keine"
+            providers_info = ", ".join(provider_list) if provider_list else "keine"
+        else:
+            employers_info = "keine"
+            providers_info = "keine"
         work_paths_info = ", ".join(decision_context.top_work_paths) if decision_context else "keine"
         private_paths_info = ", ".join(decision_context.top_private_paths) if decision_context else "keine"
+        profile_context = (
+            decision_context.profile_context_text
+            if decision_context and decision_context.profile_context_text
+            else (
+                "Person: Edgar Richter.\n"
+                "Beschaeftigungsverlauf: seit 2025-08-01 WBS TRAINING AG; davor msg systems ag.\n"
+                "Privatfahrzeuge: VW Polo.\n"
+                "Firmenfahrzeuge: Toyota.\n"
+                "Weitere Hinweise: DRK-Mitglied, AOK PLUS."
+            )
+        )
+        examples_text = "keine"
+        if few_shot_examples and not compact_mode:
+            lines = []
+            for idx, ex in enumerate(few_shot_examples[:LEARNING_EXAMPLE_LIMIT], 1):
+                lines.append(
+                    f"{idx}) Titel~{ex.get('doc_title', '?')} -> "
+                    f"Korr={ex.get('correspondent', '?')}, "
+                    f"Typ={ex.get('document_type', '?')}, "
+                    f"Pfad={ex.get('storage_path', '?')}, "
+                    f"Tags={', '.join(ex.get('tags') or []) or 'keine'}"
+                )
+            examples_text = "\n".join(lines)
 
-        prompt = f"""Paperless-NGX Dokument organisieren. Besitzer: Edgar Richter, Reichenbach/Sachsen.
-Job: Systemadministrator bei WBS TRAINING AG (seit Aug 2025). Vorher: Azubi msg systems ag (2022-2025, Fachinformatiker). DRK-Mitglied. AOK PLUS.
-Fahrzeugkontext: Privatwagen = VW Polo (auch "Golf Polo"/"Polo"), Firmenwagen = Toyota.
+        learning_hint_text = "keine"
+        if learning_hints and not compact_mode:
+            lines = []
+            for idx, hint in enumerate(learning_hints[:LEARNING_PRIOR_MAX_HINTS], 1):
+                corr = hint.get("correspondent", "?")
+                count = int(hint.get("count", 0) or 0)
+                top_type = hint.get("top_document_type", "") or "?"
+                top_type_ratio = float(hint.get("document_type_ratio", 0.0) or 0.0)
+                top_path = hint.get("top_storage_path", "") or "?"
+                top_path_ratio = float(hint.get("storage_path_ratio", 0.0) or 0.0)
+                top_tags = hint.get("top_tags") or []
+                lines.append(
+                    f"{idx}) {corr} (n={count}) -> Typ {top_type} ({top_type_ratio:.0%}), "
+                    f"Pfad {top_path} ({top_path_ratio:.0%}), Tags {', '.join(top_tags) or 'keine'}"
+                )
+            learning_hint_text = "\n".join(lines)
+
+        path_names = [p["name"] for p in existing_paths if "Duplikat" not in p["name"]]
+        if compact_mode:
+            path_names = path_names[:max(8, LLM_COMPACT_PROMPT_MAX_PATHS)]
+            prompt = f"""Paperless-NGX: Dokument kurz zuordnen.
+DOKUMENT #{document['id']}:
+Titel: {document.get('title', '?')} | Datei: {document.get('original_file_name', '?')}
+Aktuell: Tags={current_tags or 'keine'} | Korr={current_corr or 'keiner'} | Typ={current_type or 'keiner'} | Pfad={current_path or 'keiner'}
+
+INHALT (AUSZUG):
+{content_preview}
+
+ERLAUBTE KORRESPONDENTEN: {', '.join(corr_names)}
+ERLAUBTE DOKUMENTTYPEN: {', '.join(ALLOWED_DOC_TYPES)}
+ERLAUBTE SPEICHERPFADE: {', '.join(path_names)}
+ERLAUBTE TAGS: {', '.join(tag_choices)}
+
+REGELN:
+- Korrespondent = konkreter Absender im Dokument.
+- Keine neuen Tags erfinden, max {MAX_TAGS_PER_DOC} Tags.
+- storage_path muss exakt aus der Liste sein.
+- Wenn unsicher: bestehenden Korrespondenten beibehalten.
+- confidence nur: high, medium, low.
+
+NUR JSON:
+{{"title": "Titel", "tags": ["Tag1", "Tag2"], "correspondent": "Firma", "document_type": "Typ", "storage_path_name": "Kategorie", "storage_path": "Kategorie/Sub", "confidence": "high", "reasoning": "Kurz"}}"""
+        else:
+            prompt = f"""Paperless-NGX Dokument organisieren.
+{profile_context}
 
 DOKUMENT #{document['id']}:
 Titel: {document.get('title', '?')} | Datei: {document.get('original_file_name', '?')} | Erstellt: {document.get('created', '?')}
@@ -1495,7 +2317,7 @@ KORRESPONDENTEN (bevorzuge vorhandene): {', '.join(corr_names)}
 DOKUMENTTYPEN (NUR diese): {', '.join(ALLOWED_DOC_TYPES)}
 
 SPEICHERPFADE (NUR diese Kategorienamen verwenden, NICHT den vollen Pfad mit Jahr/Titel!):
-{', '.join(p['name'] for p in existing_paths if 'Duplikat' not in p['name'])}
+{', '.join(path_names)}
 WICHTIG: storage_path muss EXAKT einem der obigen Namen entsprechen, z.B. "Auto/Unfall" oder "Finanzen/Bank"
 
 ERLAUBTE TAGS (NUR aus dieser Liste waehlen, keine neuen erfinden):
@@ -1509,6 +2331,10 @@ KONTEXT (vorher gesammelt):
 - erkannte externe Anbieter: {providers_info}
 - haeufige Arbeitspfade: {work_paths_info}
 - haeufige Nicht-Arbeitspfade: {private_paths_info}
+- bestaetigte aehnliche Beispiele:
+{examples_text}
+- lernende Korrespondent-Hinweise (aus bestaetigten Faellen):
+{learning_hint_text}
 
 ZUORDNUNGSREGELN - GENAU BEACHTEN:
 - Arbeit/msg: NUR Dokumente die DIREKT von msg systems ag stammen (Arbeitsvertrag, Zeugnis, Gehaltsabrechnung MIT msg im Absender/Inhalt)
@@ -1516,7 +2342,10 @@ ZUORDNUNGSREGELN - GENAU BEACHTEN:
 - NIEMALS Arbeitgeber als Korrespondent setzen, wenn im Dokument klar ein externer Anbieter steht (z.B. Google Cloud, GitHub, JetBrains, OpenAI, ElevenLabs)
 - NICHT zu Arbeit: Software-Abos (Claude, GitHub, JetBrains, etc.), Weiterbildungen die privat bezahlt werden, private Cloud-Dienste, Technik-Kaeufe
 - Software-Abos, KI-Dienste, Cloud-Dienste, Hosting -> Freizeit/IT oder Finanzen je nach Kontext
-- DRK/Wasserwacht/Blutspende -> Persoenlich/DRK oder Ausbildung/DRK
+- Korrespondent muss der KONKRETE Absender sein, nicht ein Oberbegriff.
+- Verwandte Organisationen NICHT zusammenziehen (z.B. Tochterfirma, Abteilung, Dienst, Klinik, Kreisverband, Wasserwacht, Blutspendedienst sind getrennte Absender).
+- Bei Mehrdeutigkeit immer offiziellen Absender aus Briefkopf/Fusszeile bevorzugen.
+- Wenn unklar: bestehenden Korrespondenten beibehalten statt neuen erfinden.
 - Versicherungen -> Versicherungen/[Typ]
 - Bank/Finanzen/Depot -> Finanzen/Bank oder Finanzen/Depot
 - Arzt/Gesundheit/AOK -> Gesundheit
@@ -1527,12 +2356,24 @@ ZUORDNUNGSREGELN - GENAU BEACHTEN:
 
 WEITERE REGELN: Tags kurz und sinnvoll. Titel deutsch, aussagekraeftig. Korrespondent=Absender/Firma.
 confidence: Wie sicher bist du dir bei der Zuordnung? "high", "medium" oder "low".
+Antwort moeglichst kurz und strukturiert.
 
 NUR JSON, kein anderer Text:
 {{"title": "Titel", "tags": ["Tag1", "Tag2"], "correspondent": "Firma", "document_type": "Typ", "storage_path_name": "Kategorie", "storage_path": "Kategorie/Sub", "confidence": "high", "reasoning": "Kurz"}}"""
 
+        effective_read_timeout = (
+            int(read_timeout_override)
+            if read_timeout_override is not None
+            else (LLM_COMPACT_TIMEOUT if compact_mode else LLM_TIMEOUT)
+        )
+
         # LLM-Anfrage
-        response = self._call_llm(prompt)
+        response = self._call_llm(
+            prompt,
+            read_timeout=effective_read_timeout,
+            retries=1 if compact_mode else LLM_RETRY_COUNT,
+            max_tokens=LLM_COMPACT_MAX_TOKENS if compact_mode else LLM_MAX_TOKENS,
+        )
 
         # JSON parsen - bei Fehler Retry mit strengerem Prompt
         try:
@@ -1544,12 +2385,17 @@ NUR JSON, kein anderer Text:
                 "WICHTIG: Antworte AUSSCHLIESSLICH mit einem einzigen JSON-Objekt. "
                 "Kein Text davor oder danach. Keine Markdown-Formatierung."
             )
-            response = self._call_llm(retry_prompt)
+            response = self._call_llm(
+                retry_prompt,
+                read_timeout=effective_read_timeout,
+                retries=1,
+                max_tokens=LLM_COMPACT_MAX_TOKENS if compact_mode else LLM_MAX_TOKENS,
+            )
             suggestion = self._parse_json_response(response)
 
         # Bei niedriger Konfidenz: Verifikation mit zweitem LLM-Aufruf
         confidence = suggestion.get("confidence", "high").lower()
-        if confidence in ("low", "medium"):
+        if LLM_VERIFY_ON_LOW_CONFIDENCE and not compact_mode and confidence in ("low", "medium"):
             log.info(f"  [yellow]Konfidenz: {confidence}[/yellow] -> Verifiziere Zuordnung...")
             suggestion = self._verify_suggestion(document, suggestion, content_preview)
 
@@ -1583,7 +2429,12 @@ WICHTIGE REGELN:
 Antworte NUR mit korrigiertem JSON (oder identischem wenn alles stimmt):
 {{"title": "Titel", "tags": ["Tag1", "Tag2"], "correspondent": "Firma", "document_type": "Typ", "storage_path_name": "Kategorie", "storage_path": "Kategorie/Sub", "confidence": "high", "reasoning": "Kurz"}}"""
 
-        response = self._call_llm(verify_prompt)
+        response = self._call_llm(
+            verify_prompt,
+            read_timeout=LLM_COMPACT_TIMEOUT,
+            retries=1,
+            max_tokens=LLM_COMPACT_MAX_TOKENS,
+        )
         try:
             verified = self._parse_json_response(response)
             if verified.get("storage_path") != suggestion.get("storage_path"):
@@ -1599,7 +2450,8 @@ Antworte NUR mit korrigiertem JSON (oder identischem wenn alles stimmt):
     def _use_ollama_chat_api(self) -> bool:
         return self.url.rstrip("/").endswith("/api/chat")
 
-    def _build_payload(self, prompt: str) -> dict:
+    def _build_payload(self, prompt: str, max_tokens: int | None = None) -> dict:
+        token_limit = max(64, int(max_tokens if max_tokens is not None else LLM_MAX_TOKENS))
         if self._use_ollama_chat_api():
             messages = []
             if LLM_SYSTEM_PROMPT:
@@ -1610,7 +2462,7 @@ Antworte NUR mit korrigiertem JSON (oder identischem wenn alles stimmt):
                 "stream": False,
                 "options": {
                     "temperature": LLM_TEMPERATURE,
-                    "num_predict": LLM_MAX_TOKENS,
+                    "num_predict": token_limit,
                 },
             }
             if self.model:
@@ -1630,7 +2482,7 @@ Antworte NUR mit korrigiertem JSON (oder identischem wenn alles stimmt):
         payload = {
             "messages": [{"role": "user", "content": prompt}],
             "temperature": LLM_TEMPERATURE,
-            "max_tokens": LLM_MAX_TOKENS,
+            "max_tokens": token_limit,
         }
         if self.model:
             payload["model"] = self.model
@@ -1678,33 +2530,67 @@ Antworte NUR mit korrigiertem JSON (oder identischem wenn alles stimmt):
             text = text[:300] + "..."
         return text
 
-    def _post_with_retry(self, headers: dict | None, payload: dict) -> requests.Response:
+    def _post_with_retry(
+        self,
+        headers: dict | None,
+        payload: dict,
+        read_timeout: int | None = None,
+        retries: int | None = None,
+    ) -> requests.Response:
         last_resp = None
-        for attempt in range(3):
-            resp = requests.post(self.url, headers=headers, json=payload, timeout=LLM_TIMEOUT)
-            last_resp = resp
-            if resp.ok:
+        last_exc: Exception | None = None
+        connect_timeout = max(3, LLM_CONNECT_TIMEOUT)
+        effective_read_timeout = max(5, int(read_timeout if read_timeout is not None else LLM_TIMEOUT))
+        max_attempts = max(1, int(retries if retries is not None else LLM_RETRY_COUNT))
+        for attempt in range(max_attempts):
+            try:
+                resp = requests.post(
+                    self.url,
+                    headers=headers,
+                    json=payload,
+                    timeout=(connect_timeout, effective_read_timeout),
+                )
+                last_resp = resp
+                if resp.ok:
+                    return resp
+                # Manche lokalen Server liefern kurzzeitig leere 400/5xx bei Last.
+                transient_400 = resp.status_code == 400 and not (resp.text or "").strip()
+                if resp.status_code in (429, 500, 502, 503, 504) or transient_400:
+                    if attempt < max_attempts - 1:
+                        time.sleep(0.8 + attempt * 0.8)
+                        continue
+                    continue
                 return resp
-            # Manche lokalen Server liefern kurzzeitig leere 400/5xx bei Last.
-            transient_400 = resp.status_code == 400 and not (resp.text or "").strip()
-            if resp.status_code in (429, 500, 502, 503, 504) or transient_400:
-                time.sleep(0.8 + attempt * 0.6)
-                continue
-            return resp
+            except requests.exceptions.Timeout:
+                # Timeout sofort nach oben geben. Der Aufrufer steuert den Kompakt-Retry.
+                raise
+            except requests.exceptions.RequestException as exc:
+                last_exc = exc
+                if attempt < max_attempts - 1:
+                    time.sleep(0.8 + attempt * 0.8)
+                    continue
+        if last_exc is not None:
+            raise last_exc
         return last_resp
 
-    def _call_llm(self, prompt: str) -> str:
+    def _call_llm(
+        self,
+        prompt: str,
+        read_timeout: int | None = None,
+        retries: int | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
         """Sendet Prompt an LLM-Endpunkt und gibt Antwort zurueck."""
         headers = self._auth_headers()
-        payload = self._build_payload(prompt)
-        resp = self._post_with_retry(headers, payload)
+        payload = self._build_payload(prompt, max_tokens=max_tokens)
+        resp = self._post_with_retry(headers, payload, read_timeout=read_timeout, retries=retries)
 
         # Retry 1: if model handling might be the issue, use server-default once.
         if resp.status_code in (400, 422) and self.model:
             model_backup = self.model
             self.model = ""
-            retry_payload = self._build_payload(prompt)
-            retry_resp = self._post_with_retry(headers, retry_payload)
+            retry_payload = self._build_payload(prompt, max_tokens=max_tokens)
+            retry_resp = self._post_with_retry(headers, retry_payload, read_timeout=read_timeout, retries=1)
             if retry_resp.ok:
                 resp = retry_resp
             else:
@@ -1715,8 +2601,8 @@ Antworte NUR mit korrigiertem JSON (oder identischem wenn alles stimmt):
             detected_model = self._discover_model(headers)
             if detected_model:
                 self.model = detected_model
-                retry_payload = self._build_payload(prompt)
-                retry_resp = self._post_with_retry(headers, retry_payload)
+                retry_payload = self._build_payload(prompt, max_tokens=max_tokens)
+                retry_resp = self._post_with_retry(headers, retry_payload, read_timeout=read_timeout, retries=1)
                 if retry_resp.ok:
                     resp = retry_resp
 
@@ -1729,9 +2615,9 @@ Antworte NUR mit korrigiertem JSON (oder identischem wenn alles stimmt):
         return self._extract_response_text(resp.json())
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # ID-Aufloesung & Anzeige (aus main.py)
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def resolve_ids(paperless: PaperlessClient, suggestion: dict,
                 tags: list, correspondents: list,
@@ -1813,20 +2699,24 @@ def resolve_ids(paperless: PaperlessClient, suggestion: dict,
         if key in corr_map:
             corr_id = corr_map[key]
         else:
-            try:
-                console.print(f"  [yellow]+ Neuer Korrespondent:[/yellow] {resolved_corr_name}")
-                new = paperless.create_correspondent(resolved_corr_name)
-                corr_id = new["id"]
-                correspondents.append(new)
-            except requests.exceptions.HTTPError:
-                fresh = paperless.get_correspondents()
-                corr_map = {c["name"].lower(): c["id"] for c in fresh}
-                corr_id = corr_map.get(key)
-                correspondents.clear()
-                correspondents.extend(fresh)
+            if not ALLOW_NEW_CORRESPONDENTS:
+                log.info(f"  [yellow]Korrespondent nicht erstellt (Policy):[/yellow] {resolved_corr_name}")
+            else:
+                try:
+                    console.print(f"  [yellow]+ Neuer Korrespondent:[/yellow] {resolved_corr_name}")
+                    new = paperless.create_correspondent(resolved_corr_name)
+                    corr_id = new["id"]
+                    correspondents.append(new)
+                except requests.exceptions.HTTPError:
+                    fresh = paperless.get_correspondents()
+                    corr_map = {c["name"].lower(): c["id"] for c in fresh}
+                    corr_id = corr_map.get(key)
+                    correspondents.clear()
+                    correspondents.extend(fresh)
 
     # Dokumenttyp (nur aus erlaubter Liste)
     type_map = {t["name"].lower(): t["id"] for t in doc_types}
+    type_exact = {t["name"]: t["id"] for t in doc_types}
     type_id = None
     type_name = suggestion.get("document_type", "")
     if type_name:
@@ -1834,21 +2724,25 @@ def resolve_ids(paperless: PaperlessClient, suggestion: dict,
         key = type_name.lower()
         if key not in allowed_lower:
             console.print(f"  [red]Dokumenttyp '{type_name}' nicht erlaubt, uebersprungen.[/red]")
-        elif key in type_map:
-            type_id = type_map[key]
         else:
             canonical_name = allowed_lower[key]
-            try:
-                console.print(f"  [yellow]+ Neuer Dokumenttyp:[/yellow] {canonical_name}")
-                new = paperless.create_document_type(canonical_name)
-                type_id = new["id"]
-                doc_types.append(new)
-            except requests.exceptions.HTTPError:
-                fresh = paperless.get_document_types()
-                type_map = {t["name"].lower(): t["id"] for t in fresh}
-                type_id = type_map.get(key)
-                doc_types.clear()
-                doc_types.extend(fresh)
+            canonical_id = type_exact.get(canonical_name)
+            if canonical_id is not None:
+                type_id = canonical_id
+            else:
+                # Falls nur eine nicht-canonical Variante existiert, canonical Typ erzeugen.
+                try:
+                    console.print(f"  [yellow]+ Neuer Dokumenttyp:[/yellow] {canonical_name}")
+                    new = paperless.create_document_type(canonical_name)
+                    type_id = new["id"]
+                    doc_types.append(new)
+                except requests.exceptions.HTTPError:
+                    fresh = paperless.get_document_types()
+                    type_map = {t["name"].lower(): t["id"] for t in fresh}
+                    type_exact = {t["name"]: t["id"] for t in fresh}
+                    type_id = type_exact.get(canonical_name) or type_map.get(key)
+                    doc_types.clear()
+                    doc_types.extend(fresh)
 
     # Speicherpfad
     path_name_map = {p["name"].lower(): p["id"] for p in storage_paths}
@@ -1934,17 +2828,20 @@ def show_suggestion(document: dict, suggestion: dict, asn: int | None,
         console.print(Panel(suggestion["reasoning"], title="Begruendung", border_style="blue"))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Dokument-Verarbeitung
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def process_document(doc_id: int, paperless: PaperlessClient,
                      analyzer: LocalLLMAnalyzer, tags: list,
                      correspondents: list, doc_types: list,
                      storage_paths: list, dry_run: bool = True,
                      batch_mode: bool = False,
+                     prefer_compact: bool = False,
                      taxonomy: TagTaxonomy | None = None,
                      decision_context: DecisionContext | None = None,
+                     learning_profile: LearningProfile | None = None,
+                     learning_examples: LearningExamples | None = None,
                      run_db: LocalStateDB | None = None,
                      run_id: int | None = None) -> bool:
     """Einzelnes Dokument analysieren und organisieren."""
@@ -1964,6 +2861,12 @@ def process_document(doc_id: int, paperless: PaperlessClient,
     log.info(f"  Geladen: [white]{doc_title}[/white] ({content_len} Zeichen)")
 
     log.info(f"  LLM-Analyse laeuft... (Modell: {analyzer.model})")
+    few_shot_examples = learning_examples.select(document, limit=LEARNING_EXAMPLE_LIMIT) if learning_examples else []
+    learning_hints = (
+        learning_examples.routing_hints_for_document(document, limit=LEARNING_PRIOR_MAX_HINTS)
+        if learning_examples else []
+    )
+    initial_compact = bool(prefer_compact)
     t_start = time.perf_counter()
     try:
         suggestion = analyzer.analyze(
@@ -1974,6 +2877,9 @@ def process_document(doc_id: int, paperless: PaperlessClient,
             storage_paths,
             taxonomy=taxonomy,
             decision_context=decision_context,
+            few_shot_examples=[] if initial_compact else few_shot_examples,
+            learning_hints=learning_hints,
+            compact_mode=initial_compact,
         )
     except json.JSONDecodeError as e:
         log.error(f"  JSON-Parse-Fehler: {e}")
@@ -1981,15 +2887,98 @@ def process_document(doc_id: int, paperless: PaperlessClient,
             run_db.record_document(run_id, doc_id, "error_json", document, error=str(e))
         return False
     except requests.exceptions.Timeout:
-        log.error(f"  Timeout: LLM hat zu lange gebraucht.")
-        if run_db and run_id:
-            run_db.record_document(run_id, doc_id, "error_timeout", document, error="llm timeout")
-        return False
+        if initial_compact:
+            retry_timeout = max(LLM_COMPACT_TIMEOUT_RETRY, LLM_COMPACT_TIMEOUT + 10)
+            log.warning(
+                f"  Timeout im Kompaktmodus ({LLM_COMPACT_TIMEOUT}s) - Retry mit erweitertem Kompakt-Timeout "
+                f"({retry_timeout}s)..."
+            )
+            try:
+                suggestion = analyzer.analyze(
+                    document,
+                    tags,
+                    correspondents,
+                    doc_types,
+                    storage_paths,
+                    taxonomy=taxonomy,
+                    decision_context=decision_context,
+                    few_shot_examples=[],
+                    learning_hints=learning_hints,
+                    compact_mode=True,
+                    read_timeout_override=retry_timeout,
+                )
+            except requests.exceptions.Timeout:
+                log.error(f"  Timeout im Kompaktmodus: LLM hat zu lange gebraucht (Server: {analyzer.url}).")
+                if run_db and run_id:
+                    run_db.record_document(run_id, doc_id, "error_timeout", document, error="llm timeout compact")
+                return False
+            except Exception as compact_retry_exc:
+                log.error(f"  Fehler im erweiterten Kompakt-Retry: {compact_retry_exc}")
+                if run_db and run_id:
+                    run_db.record_document(run_id, doc_id, "error_generic", document, error=str(compact_retry_exc))
+                return False
+        else:
+            log.warning(
+                f"  Timeout beim ersten Versuch ({LLM_TIMEOUT}s) - Kompakt-Retry ohne Few-Shot ({LLM_COMPACT_TIMEOUT}s)..."
+            )
+            try:
+                suggestion = analyzer.analyze(
+                    document,
+                    tags,
+                    correspondents,
+                    doc_types,
+                    storage_paths,
+                    taxonomy=taxonomy,
+                    decision_context=decision_context,
+                    few_shot_examples=[],
+                    learning_hints=learning_hints,
+                    compact_mode=True,
+                )
+            except requests.exceptions.Timeout:
+                if _is_fully_organized(document):
+                    log.warning("  Timeout im Recheck - bestehende Zuordnung bleibt unveraendert.")
+                    if run_db and run_id:
+                        run_db.record_document(run_id, doc_id, "timeout_kept_existing", document, error="llm timeout recheck")
+                    return False
+                log.error(f"  Timeout: LLM hat zu lange gebraucht (Server: {analyzer.url}).")
+                if run_db and run_id:
+                    run_db.record_document(run_id, doc_id, "error_timeout", document, error="llm timeout")
+                return False
+            except json.JSONDecodeError as e:
+                log.error(f"  JSON-Parse-Fehler nach Kompakt-Retry: {e}")
+                if run_db and run_id:
+                    run_db.record_document(run_id, doc_id, "error_json", document, error=str(e))
+                return False
+            except Exception as e:
+                log.error(f"  Fehler nach Kompakt-Retry: {e}")
+                if run_db and run_id:
+                    run_db.record_document(run_id, doc_id, "error_generic", document, error=str(e))
+                return False
     except requests.exceptions.ConnectionError:
-        log.error(f"  LLM nicht erreichbar! Ist LM Studio gestartet?")
-        if run_db and run_id:
-            run_db.record_document(run_id, doc_id, "error_llm_connection", document, error="llm connection failed")
-        return False
+        log.warning("  Verbindungsfehler beim ersten Versuch - Kompakt-Retry ohne Few-Shot...")
+        try:
+            suggestion = analyzer.analyze(
+                document,
+                tags,
+                correspondents,
+                doc_types,
+                storage_paths,
+                taxonomy=taxonomy,
+                decision_context=decision_context,
+                few_shot_examples=[],
+                learning_hints=learning_hints,
+                compact_mode=True,
+            )
+        except requests.exceptions.RequestException:
+            log.error(f"  LLM nicht erreichbar! Endpoint: {analyzer.url}")
+            if run_db and run_id:
+                run_db.record_document(run_id, doc_id, "error_llm_connection", document, error="llm connection failed")
+            return False
+        except Exception as e:
+            log.error(f"  Fehler nach Verbindungs-Retry: {e}")
+            if run_db and run_id:
+                run_db.record_document(run_id, doc_id, "error_generic", document, error=str(e))
+            return False
     except Exception as e:
         log.error(f"  Fehler: {e}")
         if run_db and run_id:
@@ -2018,6 +3007,24 @@ def process_document(doc_id: int, paperless: PaperlessClient,
     )
     for fix in vehicle_fixes:
         log.info(f"  [cyan]Vehicle-Guardrail[/cyan]: {fix}")
+
+    topic_fixes = _apply_topic_guardrails(
+        document,
+        suggestion,
+        correspondents,
+        storage_paths,
+        decision_context=decision_context,
+    )
+    for fix in topic_fixes:
+        log.info(f"  [cyan]Topic-Guardrail[/cyan]: {fix}")
+
+    learning_fixes = _apply_learning_guardrails(
+        suggestion,
+        storage_paths,
+        learning_hints,
+    )
+    for fix in learning_fixes:
+        log.info(f"  [cyan]Learning-Guardrail[/cyan]: {fix}")
 
     selected_tags, dropped_tags = _select_controlled_tags(
         suggestion.get("tags", []),
@@ -2085,9 +3092,21 @@ def process_document(doc_id: int, paperless: PaperlessClient,
             result, fallback_notes = _apply_update_with_fallbacks(paperless, doc_id, update_data)
             for note in fallback_notes:
                 log.warning(f"  [yellow]API-Fallback[/yellow]: {note}")
-        log.info(f"[bold green]FERTIG[/bold green] Dokument #{doc_id} aktualisiert -> {result.get('archived_file_name', '?')}")
+        result_label = result.get("archived_file_name") or result.get("original_file_name") or result.get("title") or "?"
+        log.info(f"[bold green]FERTIG[/bold green] Dokument #{doc_id} aktualisiert -> {result_label}")
         if run_db and run_id:
             run_db.record_document(run_id, doc_id, "updated", document, suggestion=suggestion)
+        if learning_profile:
+            try:
+                learning_profile.learn_from_document(document, suggestion)
+                learning_profile.save()
+            except Exception as learn_exc:
+                log.warning(f"  [yellow]Learning-Profil Update uebersprungen:[/yellow] {learn_exc}")
+        if learning_examples:
+            try:
+                learning_examples.append(document, suggestion)
+            except Exception as ex_exc:
+                log.warning(f"  [yellow]Learning-Beispiele Update uebersprungen:[/yellow] {ex_exc}")
         return True
     except Exception as exc:
         reason_text = f"update-fehler: {exc}"
@@ -2116,8 +3135,11 @@ def auto_organize_all(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
                       tags: list, correspondents: list, doc_types: list,
                       storage_paths: list, dry_run: bool,
                       force_recheck_all: bool = False,
+                      prefer_compact: bool = False,
                       taxonomy: TagTaxonomy | None = None,
                       decision_context: DecisionContext | None = None,
+                      learning_profile: LearningProfile | None = None,
+                      learning_examples: LearningExamples | None = None,
                       run_db: LocalStateDB | None = None,
                       run_id: int | None = None):
     """Scannt ALLE Dokumente, ueberspringt bereits sortierte, organisiert den Rest."""
@@ -2148,7 +3170,32 @@ def auto_organize_all(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
         log.info(f"  [green]{len(already_done)} bereits vollstaendig sortiert[/green] -> uebersprungen")
         log.info(f"  [yellow]{len(todo)} muessen noch sortiert werden[/yellow]")
 
+    skipped_recent_total = 0
+    if run_db and todo and SKIP_RECENT_LLM_ERRORS_THRESHOLD > 0 and SKIP_RECENT_LLM_ERRORS_MINUTES > 0:
+        filtered_todo = []
+        for d in todo:
+            recent_errors = run_db.count_recent_document_statuses(
+                d["id"],
+                ["error_timeout", "error_llm_connection"],
+                SKIP_RECENT_LLM_ERRORS_MINUTES,
+            )
+            if recent_errors >= SKIP_RECENT_LLM_ERRORS_THRESHOLD:
+                skipped_recent_total += 1
+                continue
+            filtered_todo.append(d)
+        if skipped_recent_total:
+            log.warning(
+                f"  {skipped_recent_total} Dokumente mit frischen LLM-Fehlern werden voruebergehend "
+                f"({SKIP_RECENT_LLM_ERRORS_MINUTES} min) uebersprungen"
+            )
+        todo = filtered_todo
+
     if not todo:
+        if skipped_recent_total:
+            log.warning(
+                f"[yellow]Nichts verarbeitet: {skipped_recent_total} Dokumente sind temporÃ¤r im LLM-Fehler-Backoff.[/yellow]"
+            )
+            return {"total": total, "todo": 0, "applied": 0, "errors": 0, "skipped_recent_errors": skipped_recent_total}
         log.info("[bold green]Alles sortiert! Nichts zu tun.[/bold green]")
         return {"total": total, "todo": 0, "applied": 0, "errors": 0}
 
@@ -2175,8 +3222,11 @@ def auto_organize_all(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
             try:
                 if process_document(doc["id"], paperless, analyzer, tags, correspondents,
                                     doc_types, storage_paths, dry_run, batch_mode=not dry_run,
+                                    prefer_compact=prefer_compact,
                                     taxonomy=taxonomy,
                                     decision_context=decision_context,
+                                    learning_profile=learning_profile,
+                                    learning_examples=learning_examples,
                                     run_db=run_db, run_id=run_id):
                     applied += 1
             except Exception as e:
@@ -2199,8 +3249,11 @@ def auto_organize_all(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
                     storage_paths,
                     dry_run,
                     True,
+                    prefer_compact,
                     taxonomy,
                     decision_context,
+                    learning_profile,
+                    learning_examples,
                     run_db,
                     run_id,
                 ): doc["id"]
@@ -2240,6 +3293,8 @@ def batch_process(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
                   limit: int = 0,
                   taxonomy: TagTaxonomy | None = None,
                   decision_context: DecisionContext | None = None,
+                  learning_profile: LearningProfile | None = None,
+                  learning_examples: LearningExamples | None = None,
                   run_db: LocalStateDB | None = None,
                   run_id: int | None = None):
     """Mehrere Dokumente mit Filter verarbeiten."""
@@ -2268,6 +3323,26 @@ def batch_process(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
         documents = [d for d in documents if not _is_fully_organized(d)]
         log.info(f"  {len(documents)} nicht vollstaendig organisiert")
 
+    skipped_recent_total = 0
+    if run_db and documents and SKIP_RECENT_LLM_ERRORS_THRESHOLD > 0 and SKIP_RECENT_LLM_ERRORS_MINUTES > 0:
+        filtered_docs = []
+        for d in documents:
+            recent_errors = run_db.count_recent_document_statuses(
+                d["id"],
+                ["error_timeout", "error_llm_connection"],
+                SKIP_RECENT_LLM_ERRORS_MINUTES,
+            )
+            if recent_errors >= SKIP_RECENT_LLM_ERRORS_THRESHOLD:
+                skipped_recent_total += 1
+                continue
+            filtered_docs.append(d)
+        if skipped_recent_total:
+            log.warning(
+                f"  {skipped_recent_total} Dokumente mit frischen LLM-Fehlern werden voruebergehend "
+                f"({SKIP_RECENT_LLM_ERRORS_MINUTES} min) uebersprungen"
+            )
+        documents = filtered_docs
+
     # Limit (0 = alle)
     if limit > 0 and len(documents) > limit:
         documents = documents[:limit]
@@ -2275,7 +3350,10 @@ def batch_process(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
     log.info(f"  Verarbeite {len(documents)} Dokumente")
 
     if not documents:
-        log.info("[yellow]Keine Dokumente gefunden.[/yellow]")
+        if skipped_recent_total:
+            log.warning("[yellow]Keine verarbeitbaren Dokumente: alle Kandidaten sind im LLM-Fehler-Backoff.[/yellow]")
+        else:
+            log.info("[yellow]Keine Dokumente gefunden.[/yellow]")
         return {"total": 0, "applied": 0, "errors": 0}
 
     batch_start = time.perf_counter()
@@ -2290,6 +3368,8 @@ def batch_process(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
                                     doc_types, storage_paths, dry_run, batch_mode=not dry_run,
                                     taxonomy=taxonomy,
                                     decision_context=decision_context,
+                                    learning_profile=learning_profile,
+                                    learning_examples=learning_examples,
                                     run_db=run_db, run_id=run_id):
                     applied += 1
             except Exception as e:
@@ -2312,8 +3392,11 @@ def batch_process(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
                     storage_paths,
                     dry_run,
                     True,
+                    False,
                     taxonomy,
                     decision_context,
+                    learning_profile,
+                    learning_examples,
                     run_db,
                     run_id,
                 ): doc["id"]
@@ -2347,9 +3430,9 @@ def batch_process(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
     return {"total": len(documents), "applied": applied, "errors": errors}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Cleanup-Funktionen
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def _is_ascii_only(name: str) -> bool:
     """Prueft ob Name nur ASCII-Zeichen enthaelt (englisch)."""
@@ -2384,17 +3467,27 @@ def cleanup_tags(paperless: PaperlessClient, dry_run: bool = True):
         # Whitelist / geschuetzte Tags - nie loeschen
         if normalized_name in protected_tags:
             continue
+        if KEEP_UNUSED_TAXONOMY_TAGS and in_taxonomy and doc_count == 0:
+            # Verhindert Bootstrap/Delete-Pingpong bei aktivierter Taxonomie-Autocreate.
+            continue
 
         reason = ""
-        # Regel 1: Nicht-Taxonomie Tags aggressiver abbauen.
-        if not in_taxonomy and doc_count <= NON_TAXONOMY_DELETE_THRESHOLD:
-            reason = f"nicht in Taxonomie, <= {NON_TAXONOMY_DELETE_THRESHOLD} Dokumente"
-        # Regel 2: allgemeiner Low-Count-Cleanup.
-        elif doc_count <= TAG_DELETE_THRESHOLD:
-            reason = f"<= {TAG_DELETE_THRESHOLD} Dokumente"
-        # Regel 3: ASCII/Englisch nur ausserhalb Taxonomie.
-        elif not in_taxonomy and doc_count <= TAG_ENGLISH_THRESHOLD and _is_ascii_only(name):
-            reason = f"ASCII/englisch, <= {TAG_ENGLISH_THRESHOLD} Dokumente"
+        # Standard: nur ungenutzte Tags entfernen.
+        if doc_count == 0:
+            reason = "0 Dokumente" if in_taxonomy else "nicht in Taxonomie, 0 Dokumente"
+        # Optional aggressiver Modus per env.
+        elif DELETE_USED_TAGS:
+            if not in_taxonomy and doc_count <= NON_TAXONOMY_DELETE_THRESHOLD:
+                reason = f"nicht in Taxonomie, <= {NON_TAXONOMY_DELETE_THRESHOLD} Dokumente"
+            elif TAG_DELETE_THRESHOLD > 0 and doc_count <= TAG_DELETE_THRESHOLD:
+                reason = f"<= {TAG_DELETE_THRESHOLD} Dokumente"
+            elif (
+                TAG_ENGLISH_THRESHOLD > 0
+                and not in_taxonomy
+                and doc_count <= TAG_ENGLISH_THRESHOLD
+                and _is_ascii_only(name)
+            ):
+                reason = f"ASCII/englisch, <= {TAG_ENGLISH_THRESHOLD} Dokumente"
 
         if reason:
             to_delete.append((t, reason))
@@ -2423,21 +3516,107 @@ def cleanup_tags(paperless: PaperlessClient, dry_run: bool = True):
         console.print("[yellow]TESTMODUS: Nichts geloescht[/yellow]")
 
 
+def _strip_diacritics(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value or "")
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
+
+def _correspondent_core_name(value: str) -> str:
+    raw = _strip_diacritics(_normalize_correspondent_name(value).lower())
+    if not raw:
+        return ""
+    # E-Mail/URL nur exakt zusammenfassen, nicht gegen Firmennamen.
+    if "@" in raw or raw.startswith("http://") or raw.startswith("https://"):
+        return raw.strip()
+    tokens = re.findall(r"[a-z0-9]+", raw)
+    cleaned = []
+    for token in tokens:
+        if token in CORRESPONDENT_LEGAL_TOKENS:
+            continue
+        if token in CORRESPONDENT_STOPWORDS:
+            continue
+        if len(token) <= 1:
+            continue
+        cleaned.append(token)
+    return " ".join(cleaned).strip()
+
+
+def _is_correspondent_duplicate_name(name_a: str, name_b: str) -> bool:
+    core_a = _correspondent_core_name(name_a)
+    core_b = _correspondent_core_name(name_b)
+    if not core_a or not core_b or core_a == core_b:
+        return bool(core_a and core_b and core_a == core_b)
+
+    tokens_a = set(core_a.split())
+    tokens_b = set(core_b.split())
+    overlap = len(tokens_a & tokens_b)
+
+    # Keine Teilstring-Merges: nur fast identische Namen zusammenlegen.
+    ratio = difflib.SequenceMatcher(None, core_a, core_b).ratio()
+    return ratio >= CORRESPONDENT_MERGE_MIN_NAME_SIMILARITY and overlap >= 2
+
+
 def _find_correspondent_groups(correspondents: list) -> dict:
-    """Gruppiert Korrespondenten nach definierten Gruppen."""
-    groups = defaultdict(list)
-    for c in correspondents:
-        name_lower = c["name"].lower()
-        for group_name, keywords in CORRESPONDENT_GROUPS.items():
-            for kw in keywords:
-                if kw.lower() in name_lower:
-                    groups[group_name].append(c)
-                    break
+    """Findet echte Namensduplikate (generisch, konservativ)."""
+    ordered = sorted(correspondents, key=lambda c: int(c.get("document_count", 0) or 0), reverse=True)
+    by_id = {int(c["id"]): c for c in ordered if c.get("id") is not None}
+    unassigned = set(by_id.keys())
+    groups: dict[str, list] = {}
+    group_no = 1
+
+    for seed in ordered:
+        seed_id = int(seed["id"])
+        if seed_id not in unassigned:
+            continue
+
+        cluster_ids = {seed_id}
+        queue = [seed_id]
+        unassigned.remove(seed_id)
+
+        while queue:
+            current_id = queue.pop(0)
+            current = by_id[current_id]
+            for cand_id in list(unassigned):
+                cand = by_id[cand_id]
+                if _is_correspondent_duplicate_name(current.get("name", ""), cand.get("name", "")):
+                    cluster_ids.add(cand_id)
+                    queue.append(cand_id)
+                    unassigned.remove(cand_id)
+
+        cluster = [by_id[cid] for cid in cluster_ids]
+        if len(cluster) > 1:
+            cluster.sort(key=_correspondent_keep_sort_key, reverse=True)
+            label = cluster[0].get("name") or f"Duplikatgruppe {group_no}"
+            groups[label] = cluster
+            group_no += 1
+
     return groups
 
 
+def _correspondent_keep_sort_key(item: dict) -> tuple:
+    """Waehlt den stabilsten Kanonischen Namen innerhalb einer Duplikatgruppe."""
+    name = (item.get("name") or "").strip()
+    name_lower = name.lower()
+    core = _correspondent_core_name(name)
+    doc_count = int(item.get("document_count", 0) or 0)
+
+    quality = 0
+    if " via " not in name_lower:
+        quality += 2
+    if "@" not in name_lower:
+        quality += 2
+    if "http://" not in name_lower and "https://" not in name_lower:
+        quality += 2
+    if len(core.split()) >= 2:
+        quality += 1
+    if len(name) <= 70:
+        quality += 1
+
+    return (doc_count, quality, -len(name))
+
+
 def cleanup_correspondents(paperless: PaperlessClient, dry_run: bool = True):
-    """Leere loeschen + Gruppen-Merge."""
+    """Konservatives Korrespondenten-Cleanup: optional ungenutzte loeschen + echte Duplikate mergen."""
     console.print(Panel("[bold]Korrespondenten-Aufraeumung[/bold]", border_style="cyan"))
     log.info("[bold]CLEANUP KORRESPONDENTEN[/bold] gestartet")
 
@@ -2449,18 +3628,25 @@ def cleanup_correspondents(paperless: PaperlessClient, dry_run: bool = True):
     console.print(f"[yellow]Ungenutzt (0 Dokumente): {len(unused)}[/yellow]")
 
     if unused and not dry_run:
-        deleted = paperless.batch_delete("correspondents", unused, "Korrespondenten")
-        console.print(f"[green]{deleted} ungenutzte Korrespondenten geloescht[/green]")
+        if DELETE_UNUSED_CORRESPONDENTS:
+            deleted = paperless.batch_delete("correspondents", unused, "Korrespondenten")
+            console.print(f"[green]{deleted} ungenutzte Korrespondenten geloescht[/green]")
+        else:
+            console.print("[cyan]Info:[/cyan] Ungenutzte Korrespondenten bleiben erhalten (Policy).")
 
     # Duplikat-Gruppen finden
     groups = _find_correspondent_groups(correspondents)
-    duplicates = {k: v for k, v in groups.items() if len(v) > 1}
+    duplicates = {}
+    for name, items in groups.items():
+        total_docs = sum(int(c.get("document_count", 0) or 0) for c in items)
+        if len(items) > 1 and total_docs >= CORRESPONDENT_MERGE_MIN_GROUP_DOCS:
+            duplicates[name] = items
 
     if duplicates:
         console.print(f"\n[bold]{len(duplicates)} Duplikat-Gruppen gefunden:[/bold]")
         for group_name, items in sorted(duplicates.items()):
             total = sum(c.get("document_count", 0) for c in items)
-            items.sort(key=lambda x: x.get("document_count", 0), reverse=True)
+            items.sort(key=_correspondent_keep_sort_key, reverse=True)
             keep = items[0]
             merge = items[1:]
 
@@ -2498,6 +3684,56 @@ def cleanup_document_types(paperless: PaperlessClient, dry_run: bool = True):
 
     types = paperless.get_document_types()
     log.info(f"  {len(types)} Dokumenttypen geladen")
+
+    # 1) Canonical-Namen aus ALLOWED_DOC_TYPES erzwingen (z. B. "kontoauszug" -> "Kontoauszug")
+    allowed_lower = {name.lower(): name for name in ALLOWED_DOC_TYPES}
+    by_exact_name = {t["name"]: t for t in types}
+    to_normalize: list[tuple[dict, dict]] = []
+
+    for t in types:
+        current_name = (t.get("name") or "").strip()
+        key = current_name.lower()
+        canonical_name = allowed_lower.get(key)
+        if not canonical_name or current_name == canonical_name:
+            continue
+
+        target = by_exact_name.get(canonical_name)
+        if target is None and not dry_run:
+            try:
+                target = paperless.create_document_type(canonical_name)
+                types.append(target)
+                by_exact_name[canonical_name] = target
+                console.print(f"  [green]+ Canonical-Dokumenttyp erstellt:[/green] {canonical_name}")
+            except requests.exceptions.HTTPError:
+                fresh = paperless.get_document_types()
+                types = fresh
+                by_exact_name = {x["name"]: x for x in types}
+                target = by_exact_name.get(canonical_name)
+
+        if target and target["id"] != t["id"]:
+            to_normalize.append((t, target))
+
+    if to_normalize:
+        table = Table(title="Dokumenttypen-Normalisierung", show_header=True)
+        table.add_column("Von", style="yellow")
+        table.add_column("Nach", style="green")
+        table.add_column("Dokumente", justify="right")
+        for src, dst in to_normalize:
+            table.add_row(src["name"], dst["name"], str(src.get("document_count", 0)))
+        console.print(table)
+
+        if not dry_run:
+            all_docs = paperless.get_documents()
+            for src, dst in to_normalize:
+                docs_to_move = [d for d in all_docs if d.get("document_type") == src["id"]]
+                for doc in docs_to_move:
+                    paperless.update_document(doc["id"], {"document_type": dst["id"]})
+                    console.print(f"    Dokument #{doc['id']}: {src['name']} -> {dst['name']}")
+                paperless.delete_document_type(src["id"])
+                console.print(f"    [green]Geloescht:[/green] {src['name']} (normalisiert auf {dst['name']})")
+
+            types = paperless.get_document_types()
+            log.info(f"  [green]{len(to_normalize)} Dokumenttypen normalisiert[/green]")
 
     unused = [t for t in types if t.get("document_count", 0) == 0]
     console.print(f"[yellow]Ungenutzt (0 Dokumente): {len(unused)}[/yellow]")
@@ -2541,9 +3777,9 @@ def cleanup_all(paperless: PaperlessClient, dry_run: bool = True):
     cleanup_document_types(paperless, dry_run)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Duplikate finden
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def find_duplicates(paperless: PaperlessClient):
     """Erkennung nach Dateiname und Titel - Ausgabe als Rich-Table."""
@@ -2628,9 +3864,9 @@ def find_duplicates(paperless: PaperlessClient):
     log.info(f"  DUPLIKAT-SCAN fertig - {len(filename_dupes)} Dateiname-Gruppen, {len(title_dupes)} Titel-Gruppen")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Statistiken
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def show_statistics(paperless: PaperlessClient):
     """Uebersicht ueber Paperless-NGX Instanz."""
@@ -2696,9 +3932,9 @@ def show_statistics(paperless: PaperlessClient):
         console.print(table4)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Menuesystem
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class App:
     """Hauptanwendung mit Menuesystem."""
@@ -2711,6 +3947,8 @@ class App:
         self.analyzer = None
         self.run_db = LocalStateDB(STATE_DB_FILE)
         self.taxonomy = TagTaxonomy(TAXONOMY_FILE)
+        self.learning_profile = LearningProfile(LEARNING_PROFILE_FILE)
+        self.learning_examples = LearningExamples(LEARNING_EXAMPLES_FILE)
 
     def _start_run(self, action: str) -> int:
         run_id = self.run_db.start_run(action, self.dry_run, self.llm_model, self.llm_url)
@@ -2720,6 +3958,18 @@ class App:
     def _finish_run(self, run_id: int, summary: dict):
         self.run_db.finish_run(run_id, summary)
         log.info(f"Run abgeschlossen: #{run_id}")
+
+    def _reconnect_services(self, reason: str = "") -> bool:
+        """Versucht Paperless- und LLM-Verbindungen neu aufzubauen."""
+        if reason:
+            log.warning(f"Reconnect gestartet ({reason})")
+        self.paperless = None
+        self.analyzer = None
+        if not self._init_paperless():
+            return False
+        if not self._init_analyzer():
+            return False
+        return True
 
     def _init_paperless(self) -> bool:
         """Paperless-Client initialisieren."""
@@ -2800,12 +4050,20 @@ class App:
         """Phase 1: Daten sammeln, danach Entscheidungen treffen."""
         with console.status("Sammle Entscheidungsdaten..."):
             documents = self.paperless.get_documents()
-        context = build_decision_context(documents, correspondents, storage_paths)
+        context = build_decision_context(
+            documents,
+            correspondents,
+            storage_paths,
+            learning_profile=self.learning_profile,
+        )
         log.info(
-            "KONTEXT gesammelt: %s Dokumente | %s Arbeitgeber-Hints | %s Anbieter-Hints",
+            "KONTEXT gesammelt: %s Dokumente | %s Arbeitgeber-Hints | %s Anbieter-Hints | %s Jobs | %s/%s Fahrzeuge",
             len(documents),
             len(context.employer_names),
             len(context.provider_names),
+            len(context.profile_employment_lines),
+            len(context.profile_private_vehicles),
+            len(context.profile_company_vehicles),
         )
         return context
 
@@ -2826,6 +4084,8 @@ class App:
             f"Tag-Policy: {tag_policy} (max {MAX_TAGS_PER_DOC})\n"
             f"Taxonomie: {taxonomy_info} | Auto-Create: {auto_tax} | Global-Limit: {MAX_TOTAL_TAGS}\n"
             f"Auto-Modus recheck alle Dokumente: {recheck_info}\n"
+            f"Learning-Profil: {LEARNING_PROFILE_FILE}\n"
+            f"Learning-Beispiele: {LEARNING_EXAMPLES_FILE}\n"
             f"State-DB: {STATE_DB_FILE}",
             border_style="blue",
         ))
@@ -2835,7 +4095,24 @@ class App:
         console.print(f"\n[bold]{title}[/bold]")
         for key, label in options:
             console.print(f"  [cyan]{key}[/cyan]  {label}")
-        return Prompt.ask("\nAuswahl", default="0")
+        try:
+            return Prompt.ask("\nAuswahl", default="0")
+        except EOFError:
+            # Non-interactive stdin closed -> graceful exit path.
+            log.warning("Eingabestrom geschlossen (EOF) - beende Menue.")
+            return "0"
+        except KeyboardInterrupt:
+            log.info("Eingabe vom Benutzer abgebrochen (Ctrl+C).")
+            return "0"
+
+    def _run_action_safely(self, action_fn, action_label: str):
+        try:
+            action_fn()
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            log.error(f"{action_label} fehlgeschlagen: {exc}")
+            console.print(f"[red]{action_label} fehlgeschlagen:[/red] {exc}")
 
     # --- Menues ---
 
@@ -2851,23 +4128,29 @@ class App:
                 ("5", "Statistiken / Uebersicht"),
                 ("6", "Review-Queue"),
                 ("7", "Einstellungen"),
+                ("8", "Live-Watch (neue Dokumente automatisch verarbeiten)"),
+                ("9", "Vollautomatik (Sortieren + Live-Watch + Wartung)"),
                 ("0", "Beenden"),
             ])
 
             if choice == "1":
-                self.action_auto_organize()
+                self._run_action_safely(self.action_auto_organize, "Auto-Sortierung")
             elif choice == "2":
-                self.menu_organize()
+                self._run_action_safely(self.menu_organize, "Organisieren")
             elif choice == "3":
-                self.menu_cleanup()
+                self._run_action_safely(self.menu_cleanup, "Cleanup")
             elif choice == "4":
-                self.action_find_duplicates()
+                self._run_action_safely(self.action_find_duplicates, "Duplikat-Scan")
             elif choice == "5":
-                self.action_statistics()
+                self._run_action_safely(self.action_statistics, "Statistiken")
             elif choice == "6":
-                self.action_review_queue()
+                self._run_action_safely(self.action_review_queue, "Review-Queue")
             elif choice == "7":
-                self.menu_settings()
+                self._run_action_safely(self.menu_settings, "Einstellungen")
+            elif choice == "8":
+                self._run_action_safely(self.action_live_watch, "Live-Watch")
+            elif choice == "9":
+                self._run_action_safely(self.action_autopilot, "Vollautomatik")
             elif choice == "0":
                 console.print("[bold]Auf Wiedersehen![/bold]")
                 break
@@ -2912,6 +4195,8 @@ class App:
                 self.dry_run,
                 taxonomy=self.taxonomy,
                 decision_context=decision_context,
+                learning_profile=self.learning_profile,
+                learning_examples=self.learning_examples,
                 run_db=self.run_db,
                 run_id=run_id,
             )
@@ -2937,6 +4222,8 @@ class App:
                 limit=limit,
                 taxonomy=self.taxonomy,
                 decision_context=decision_context,
+                learning_profile=self.learning_profile,
+                learning_examples=self.learning_examples,
                 run_db=self.run_db,
                 run_id=run_id,
             )
@@ -2949,10 +4236,16 @@ class App:
         if not self._init_analyzer():
             return
 
+        force_recheck_all = Confirm.ask(
+            "Alle Dokumente fuer diesen Lauf neu pruefen?",
+            default=RECHECK_ALL_DOCS_IN_AUTO,
+        )
+
         tags, correspondents, doc_types, storage_paths = self._load_master_data()
         self._ensure_taxonomy_tags(tags)
         decision_context = self._collect_decision_context(correspondents, storage_paths)
-        run_id = self._start_run("auto_organize")
+        action_name = "auto_organize_recheck_all" if force_recheck_all else "auto_organize"
+        run_id = self._start_run(action_name)
         summary = auto_organize_all(
             self.paperless,
             self.analyzer,
@@ -2961,13 +4254,415 @@ class App:
             doc_types,
             storage_paths,
             self.dry_run,
-            force_recheck_all=RECHECK_ALL_DOCS_IN_AUTO,
+            force_recheck_all=force_recheck_all,
             taxonomy=self.taxonomy,
             decision_context=decision_context,
+            learning_profile=self.learning_profile,
+            learning_examples=self.learning_examples,
             run_db=self.run_db,
             run_id=run_id,
         )
         self._finish_run(run_id, summary)
+
+    def action_live_watch(self):
+        """Live-Modus: Pollt regelmaessig auf neue Dokumente und verarbeitet diese automatisch."""
+        if not self._init_paperless():
+            return
+        if not self._init_analyzer():
+            return
+
+        if not self.dry_run and not Confirm.ask(
+            "[red]LIVE-Modus aktiv! Neuen Dokumente automatisch verarbeiten?[/red]",
+            default=True,
+        ):
+            console.print("[dim]Abgebrochen.[/dim]")
+            return
+
+        interval_default = max(10, LIVE_WATCH_INTERVAL_SEC)
+        interval_str = Prompt.ask("Polling-Intervall in Sekunden", default=str(interval_default))
+        try:
+            interval_sec = max(5, int(interval_str))
+        except ValueError:
+            interval_sec = interval_default
+
+        include_existing = Confirm.ask(
+            "Beim Start auch bereits vorhandene unvollstaendige Dokumente mitnehmen?",
+            default=False,
+        )
+        refresh_cycles = max(1, LIVE_WATCH_CONTEXT_REFRESH_CYCLES)
+
+        with console.status("Initialisiere Live-Watch..."):
+            initial_docs = self.paperless.get_documents()
+
+        known_ids = set()
+        if not include_existing:
+            known_ids = {int(d["id"]) for d in initial_docs if d.get("id") is not None}
+
+        run_id = self._start_run("live_watch")
+        log.info(
+            "LIVE-WATCH gestartet: Intervall=%ss | Initial-Docs=%s | include_existing=%s",
+            interval_sec,
+            len(initial_docs),
+            "JA" if include_existing else "NEIN",
+        )
+        console.print("[cyan]Live-Watch laeuft. Stoppen mit Ctrl+C.[/cyan]")
+
+        cycle = 0
+        total_seen_new = 0
+        total_candidates = 0
+        total_updated = 0
+        total_skipped_duplicates = 0
+        total_skipped_fully_organized = 0
+        total_poll_errors = 0
+        total_doc_failures = 0
+        reconnect_attempts = 0
+        consecutive_poll_errors = 0
+        tags = []
+        correspondents = []
+        doc_types = []
+        storage_paths = []
+        decision_context = None
+
+        try:
+            while True:
+                cycle += 1
+                try:
+                    docs = self.paperless.get_documents()
+                except Exception as exc:
+                    total_poll_errors += 1
+                    consecutive_poll_errors += 1
+                    backoff = min(
+                        WATCH_ERROR_BACKOFF_MAX_SEC,
+                        interval_sec + (consecutive_poll_errors - 1) * max(1, WATCH_ERROR_BACKOFF_BASE_SEC),
+                    )
+                    log.error(f"LIVE-WATCH Poll-Fehler: {exc} (retry in {backoff}s)")
+                    if consecutive_poll_errors >= max(1, WATCH_RECONNECT_ERROR_THRESHOLD):
+                        reconnect_attempts += 1
+                        if self._reconnect_services(f"live-watch poll errors={consecutive_poll_errors}"):
+                            consecutive_poll_errors = 0
+                    time.sleep(backoff)
+                    continue
+                consecutive_poll_errors = 0
+
+                docs_by_id = {
+                    int(d["id"]): d
+                    for d in docs
+                    if d.get("id") is not None
+                }
+                current_ids = set(docs_by_id.keys())
+                new_ids = sorted(i for i in current_ids if i not in known_ids)
+                known_ids.update(current_ids)
+
+                if not new_ids:
+                    if cycle == 1 or cycle % 5 == 0:
+                        log.info(f"LIVE-WATCH: keine neuen Dokumente, warte {interval_sec}s...")
+                    time.sleep(interval_sec)
+                    continue
+
+                total_seen_new += len(new_ids)
+                log.info(f"LIVE-WATCH: {len(new_ids)} neue Dokumente erkannt")
+
+                try:
+                    tags, correspondents, doc_types, storage_paths = self._load_master_data()
+                    self._ensure_taxonomy_tags(tags)
+                    if decision_context is None or (cycle % refresh_cycles == 0):
+                        decision_context = self._collect_decision_context(correspondents, storage_paths)
+                except Exception as exc:
+                    total_poll_errors += 1
+                    log.error(f"LIVE-WATCH Stammdaten/Kontext-Fehler: {exc}")
+                    time.sleep(min(interval_sec, 15))
+                    continue
+
+                duplikat_tag_id = next((t["id"] for t in tags if t["name"] == "Duplikat"), None)
+                for doc_id in new_ids:
+                    doc = docs_by_id.get(doc_id, {})
+                    if duplikat_tag_id and duplikat_tag_id in (doc.get("tags") or []):
+                        total_skipped_duplicates += 1
+                        continue
+                    if _is_fully_organized(doc):
+                        total_skipped_fully_organized += 1
+                        continue
+
+                    total_candidates += 1
+                    try:
+                        if process_document(
+                            doc_id,
+                            self.paperless,
+                            self.analyzer,
+                            tags,
+                            correspondents,
+                            doc_types,
+                            storage_paths,
+                            self.dry_run,
+                            batch_mode=not self.dry_run,
+                            prefer_compact=LIVE_WATCH_COMPACT_FIRST,
+                            taxonomy=self.taxonomy,
+                            decision_context=decision_context,
+                            learning_profile=self.learning_profile,
+                            learning_examples=self.learning_examples,
+                            run_db=self.run_db,
+                            run_id=run_id,
+                        ):
+                            total_updated += 1
+                        else:
+                            total_doc_failures += 1
+                    except Exception as exc:
+                        total_doc_failures += 1
+                        total_poll_errors += 1
+                        log.error(f"LIVE-WATCH Fehler bei Dokument #{doc_id}: {exc}")
+
+                time.sleep(interval_sec)
+        except KeyboardInterrupt:
+            log.info("LIVE-WATCH vom Benutzer gestoppt")
+            console.print("[yellow]Live-Watch gestoppt.[/yellow]")
+        finally:
+            summary = {
+                "mode": "live_watch",
+                "cycles": cycle,
+                "seen_new": total_seen_new,
+                "candidates": total_candidates,
+                "updated": total_updated,
+                "failed_docs": total_doc_failures,
+                "skipped_duplicates": total_skipped_duplicates,
+                "skipped_fully_organized": total_skipped_fully_organized,
+                "poll_errors": total_poll_errors,
+                "reconnect_attempts": reconnect_attempts,
+                "interval_sec": interval_sec,
+                "include_existing": include_existing,
+            }
+            self._finish_run(run_id, summary)
+
+    def action_autopilot(self):
+        """Vollautomatik: initial sortieren, dann dauerhaft live beobachten + periodische Wartung."""
+        if not self._init_paperless():
+            return
+        if not self._init_analyzer():
+            return
+
+        if not self.dry_run and not Confirm.ask(
+            "[red]Vollautomatik im LIVE-Modus starten?[/red]",
+            default=True,
+        ):
+            console.print("[dim]Abgebrochen.[/dim]")
+            return
+
+        interval_sec = max(5, AUTOPILOT_INTERVAL_SEC)
+        refresh_cycles = max(1, AUTOPILOT_CONTEXT_REFRESH_CYCLES)
+        cleanup_every = max(0, AUTOPILOT_CLEANUP_EVERY_CYCLES)
+        dupscan_every = max(0, AUTOPILOT_DUPLICATE_SCAN_EVERY_CYCLES)
+        max_new_per_cycle = max(0, AUTOPILOT_MAX_NEW_DOCS_PER_CYCLE)
+
+        run_id = self._start_run("autopilot")
+        total_seen_new = 0
+        total_candidates = 0
+        total_updated = 0
+        total_skipped_duplicates = 0
+        total_skipped_fully_organized = 0
+        total_poll_errors = 0
+        total_doc_failures = 0
+        total_maintenance_runs = 0
+        total_duplicate_scans = 0
+        reconnect_attempts = 0
+        consecutive_poll_errors = 0
+        cycle = 0
+        tags = []
+        correspondents = []
+        doc_types = []
+        storage_paths = []
+        decision_context = None
+
+        try:
+            with console.status("Initialisiere Vollautomatik..."):
+                docs = self.paperless.get_documents()
+        except Exception as exc:
+            log.error(f"AUTOPILOT Initialisierung fehlgeschlagen (get_documents): {exc}")
+            self._finish_run(run_id, {
+                "mode": "autopilot",
+                "error": f"init_get_documents_failed: {exc}",
+                "cycles": 0,
+                "seen_new": 0,
+                "candidates": 0,
+                "updated": 0,
+                "poll_errors": 1,
+            })
+            return
+        known_ids = {int(d["id"]) for d in docs if d.get("id") is not None}
+
+        log.info(
+            "AUTOPILOT gestartet: interval=%ss | start_auto_organize=%s | cleanup_every=%s | dupscan_every=%s",
+            interval_sec,
+            "JA" if AUTOPILOT_START_WITH_AUTO_ORGANIZE else "NEIN",
+            cleanup_every,
+            dupscan_every,
+        )
+        console.print("[cyan]Vollautomatik laeuft. Stoppen mit Ctrl+C.[/cyan]")
+
+        try:
+            if AUTOPILOT_START_WITH_AUTO_ORGANIZE:
+                try:
+                    tags, correspondents, doc_types, storage_paths = self._load_master_data()
+                    self._ensure_taxonomy_tags(tags)
+                    decision_context = self._collect_decision_context(correspondents, storage_paths)
+                    auto_summary = auto_organize_all(
+                        self.paperless,
+                        self.analyzer,
+                        tags,
+                        correspondents,
+                        doc_types,
+                        storage_paths,
+                        self.dry_run,
+                        force_recheck_all=AUTOPILOT_RECHECK_ALL_ON_START,
+                        prefer_compact=LIVE_WATCH_COMPACT_FIRST,
+                        taxonomy=self.taxonomy,
+                        decision_context=decision_context,
+                        learning_profile=self.learning_profile,
+                        learning_examples=self.learning_examples,
+                        run_db=self.run_db,
+                        run_id=run_id,
+                    )
+                    total_updated += int(auto_summary.get("applied", 0) or 0)
+                    total_candidates += int(auto_summary.get("todo", 0) or 0)
+                    try:
+                        docs = self.paperless.get_documents()
+                        known_ids = {int(d["id"]) for d in docs if d.get("id") is not None}
+                    except Exception as exc:
+                        total_poll_errors += 1
+                        log.warning(f"AUTOPILOT: Re-Load nach Initialsortierung fehlgeschlagen: {exc}")
+                except Exception as exc:
+                    total_poll_errors += 1
+                    log.error(f"AUTOPILOT: Initiale Auto-Sortierung fehlgeschlagen: {exc}")
+
+            while True:
+                cycle += 1
+                try:
+                    docs = self.paperless.get_documents()
+                except Exception as exc:
+                    total_poll_errors += 1
+                    consecutive_poll_errors += 1
+                    backoff = min(
+                        WATCH_ERROR_BACKOFF_MAX_SEC,
+                        interval_sec + (consecutive_poll_errors - 1) * max(1, WATCH_ERROR_BACKOFF_BASE_SEC),
+                    )
+                    log.error(f"AUTOPILOT Poll-Fehler: {exc} (retry in {backoff}s)")
+                    if consecutive_poll_errors >= max(1, WATCH_RECONNECT_ERROR_THRESHOLD):
+                        reconnect_attempts += 1
+                        if self._reconnect_services(f"autopilot poll errors={consecutive_poll_errors}"):
+                            consecutive_poll_errors = 0
+                    time.sleep(backoff)
+                    continue
+                consecutive_poll_errors = 0
+
+                docs_by_id = {int(d["id"]): d for d in docs if d.get("id") is not None}
+                current_ids = set(docs_by_id.keys())
+                new_ids = sorted(i for i in current_ids if i not in known_ids)
+                known_ids.update(current_ids)
+
+                if max_new_per_cycle > 0 and len(new_ids) > max_new_per_cycle:
+                    log.warning(
+                        "AUTOPILOT: %s neue Dokumente erkannt, begrenze auf %s in diesem Zyklus",
+                        len(new_ids),
+                        max_new_per_cycle,
+                    )
+                    new_ids = new_ids[:max_new_per_cycle]
+
+                if new_ids:
+                    total_seen_new += len(new_ids)
+                    log.info(f"AUTOPILOT: {len(new_ids)} neue Dokumente erkannt")
+
+                    try:
+                        tags, correspondents, doc_types, storage_paths = self._load_master_data()
+                        self._ensure_taxonomy_tags(tags)
+                        if decision_context is None or (cycle % refresh_cycles == 0):
+                            decision_context = self._collect_decision_context(correspondents, storage_paths)
+                    except Exception as exc:
+                        total_poll_errors += 1
+                        log.error(f"AUTOPILOT Stammdaten/Kontext-Fehler: {exc}")
+                        time.sleep(min(interval_sec, 15))
+                        continue
+
+                    duplikat_tag_id = next((t["id"] for t in tags if t["name"] == "Duplikat"), None)
+                    for doc_id in new_ids:
+                        doc = docs_by_id.get(doc_id, {})
+                        if duplikat_tag_id and duplikat_tag_id in (doc.get("tags") or []):
+                            total_skipped_duplicates += 1
+                            continue
+                        if _is_fully_organized(doc):
+                            total_skipped_fully_organized += 1
+                            continue
+
+                        total_candidates += 1
+                        try:
+                            if process_document(
+                                doc_id,
+                                self.paperless,
+                                self.analyzer,
+                                tags,
+                                correspondents,
+                                doc_types,
+                                storage_paths,
+                                self.dry_run,
+                                batch_mode=not self.dry_run,
+                                prefer_compact=LIVE_WATCH_COMPACT_FIRST,
+                                taxonomy=self.taxonomy,
+                                decision_context=decision_context,
+                                learning_profile=self.learning_profile,
+                                learning_examples=self.learning_examples,
+                                run_db=self.run_db,
+                                run_id=run_id,
+                            ):
+                                total_updated += 1
+                            else:
+                                total_doc_failures += 1
+                        except Exception as exc:
+                            total_doc_failures += 1
+                            total_poll_errors += 1
+                            log.error(f"AUTOPILOT Fehler bei Dokument #{doc_id}: {exc}")
+                elif cycle == 1 or cycle % 5 == 0:
+                    log.info(f"AUTOPILOT: keine neuen Dokumente, warte {interval_sec}s...")
+
+                if cleanup_every > 0 and cycle % cleanup_every == 0:
+                    try:
+                        log.info("AUTOPILOT: periodisches Cleanup gestartet")
+                        cleanup_tags(self.paperless, self.dry_run)
+                        cleanup_correspondents(self.paperless, self.dry_run)
+                        cleanup_document_types(self.paperless, self.dry_run)
+                        total_maintenance_runs += 1
+                    except Exception as exc:
+                        total_poll_errors += 1
+                        log.error(f"AUTOPILOT Cleanup-Fehler: {exc}")
+
+                if dupscan_every > 0 and cycle % dupscan_every == 0:
+                    try:
+                        log.info("AUTOPILOT: periodischer Duplikat-Scan gestartet")
+                        find_duplicates(self.paperless)
+                        total_duplicate_scans += 1
+                    except Exception as exc:
+                        total_poll_errors += 1
+                        log.error(f"AUTOPILOT Duplikat-Scan-Fehler: {exc}")
+
+                time.sleep(interval_sec)
+        except KeyboardInterrupt:
+            log.info("AUTOPILOT vom Benutzer gestoppt")
+            console.print("[yellow]Vollautomatik gestoppt.[/yellow]")
+        finally:
+            summary = {
+                "mode": "autopilot",
+                "cycles": cycle,
+                "seen_new": total_seen_new,
+                "candidates": total_candidates,
+                "updated": total_updated,
+                "failed_docs": total_doc_failures,
+                "skipped_duplicates": total_skipped_duplicates,
+                "skipped_fully_organized": total_skipped_fully_organized,
+                "maintenance_runs": total_maintenance_runs,
+                "duplicate_scans": total_duplicate_scans,
+                "poll_errors": total_poll_errors,
+                "reconnect_attempts": reconnect_attempts,
+                "interval_sec": interval_sec,
+                "start_auto_organize": AUTOPILOT_START_WITH_AUTO_ORGANIZE,
+                "start_recheck_all": AUTOPILOT_RECHECK_ALL_ON_START,
+            }
+            self._finish_run(run_id, summary)
 
     def menu_cleanup(self):
         """Untermenue: Aufraeumen."""
@@ -3101,9 +4796,9 @@ class App:
                 console.print("[yellow]Kein offener Eintrag mit dieser ID gefunden.[/yellow]")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Main
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def main():
     log.info("=" * 40)
@@ -3117,7 +4812,12 @@ def main():
     except KeyboardInterrupt:
         console.print("\n[bold]Abgebrochen.[/bold]")
     finally:
-        log.info("Paperless-NGX Organizer beendet")
+        try:
+            log.info("Paperless-NGX Organizer beendet")
+        except KeyboardInterrupt:
+            pass
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
