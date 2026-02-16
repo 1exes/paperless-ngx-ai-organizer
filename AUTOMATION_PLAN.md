@@ -15,4 +15,7 @@ Ein stabiler Vollautomatik-Workflow ohne Tag-Wildwuchs.
 
 ## Naechste Schritte
 
-1. Monatlicher Report aus SQLite erzeugen (z. B. neue Korrespondenten, verworfene Tags, offene Reviews)
+1. ~~Monatlicher Report aus SQLite erzeugen (z. B. neue Korrespondenten, verworfene Tags, offene Reviews)~~ -- erledigt (Menue 5 -> Monatlicher Report)
+2. ~~Feedback-Loop: Aus manuellen Review-Korrekturen lernen~~ -- erledigt (`learn_from_review` + `action_review_queue` Integration)
+3. ~~Fallback-Kette: Bei LLM-Fehler Learning-Priors als Fallback nutzen~~ -- erledigt (`_build_suggestion_from_priors` + Fallback in `process_document`)
+4. ~~Auto-Resolve: Review-Queue automatisch pruefen und schliessen~~ -- erledigt (`auto_resolve_reviews` + Autopilot-Zyklus + Statistik-Menue)

@@ -235,6 +235,17 @@ class LocalStateDB:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def get_review_with_suggestion(self, review_id: int) -> dict | None:
+        with self._lock, self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT id, doc_id, suggestion_json FROM review_queue WHERE id = ?",
+                (review_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return dict(row)
+
     def close_review(self, review_id: int) -> bool:
         with self._lock, self._connect() as conn:
             cur = conn.execute(
@@ -256,6 +267,86 @@ class LocalStateDB:
         with self._lock, self._connect() as conn:
             row = conn.execute(query, tuple(params)).fetchone()
             return int((row or [0])[0])
+
+    def generate_monthly_report(self, year: int, month: int) -> dict:
+        """Monatlichen Report aus SQLite-Daten generieren."""
+        start = f"{year:04d}-{month:02d}-01T00:00:00"
+        if month == 12:
+            end = f"{year + 1:04d}-01-01T00:00:00"
+        else:
+            end = f"{year:04d}-{month + 1:02d}-01T00:00:00"
+
+        with self._lock, self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+
+            # Anzahl Laeufe
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM runs WHERE started_at >= ? AND started_at < ?",
+                (start, end),
+            ).fetchone()
+            total_runs = row["cnt"] if row else 0
+
+            # Verarbeitete Dokumente + Erfolgsquote
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS cnt FROM documents "
+                "WHERE created_at >= ? AND created_at < ? GROUP BY status",
+                (start, end),
+            ).fetchall()
+            status_counts = {r["status"]: r["cnt"] for r in rows}
+            total_docs = sum(status_counts.values())
+            success_docs = status_counts.get("ok", 0) + status_counts.get("applied", 0)
+            success_rate = (success_docs / total_docs * 100) if total_docs > 0 else 0.0
+
+            # Neue Korrespondenten (vorher leer, nachher gesetzt)
+            new_corrs = conn.execute(
+                "SELECT DISTINCT correspondent_after FROM documents "
+                "WHERE created_at >= ? AND created_at < ? "
+                "AND (correspondent_before IS NULL OR correspondent_before = '') "
+                "AND correspondent_after IS NOT NULL AND correspondent_after != ''",
+                (start, end),
+            ).fetchall()
+            new_correspondents = [r["correspondent_after"] for r in new_corrs]
+
+            # Geloeschte Tags
+            deleted_tags = conn.execute(
+                "SELECT tag_name, COUNT(*) AS cnt FROM tag_events "
+                "WHERE action = 'delete' AND created_at >= ? AND created_at < ? "
+                "GROUP BY tag_name ORDER BY cnt DESC",
+                (start, end),
+            ).fetchall()
+            deleted_tag_list = [{"name": r["tag_name"], "count": r["cnt"]} for r in deleted_tags]
+
+            # Offene Reviews (aktueller Stand, nicht zeitraumgebunden)
+            open_reviews = conn.execute(
+                "SELECT id, doc_id, reason, updated_at FROM review_queue "
+                "WHERE status = 'open' ORDER BY updated_at DESC LIMIT 20",
+            ).fetchall()
+            open_review_list = [dict(r) for r in open_reviews]
+
+            # Fehler-Uebersicht
+            errors = conn.execute(
+                "SELECT error_text, COUNT(*) AS cnt FROM documents "
+                "WHERE status = 'error' AND created_at >= ? AND created_at < ? "
+                "AND error_text != '' "
+                "GROUP BY error_text ORDER BY cnt DESC LIMIT 10",
+                (start, end),
+            ).fetchall()
+            error_list = [{"error": r["error_text"], "count": r["cnt"]} for r in errors]
+
+        return {
+            "year": year,
+            "month": month,
+            "total_runs": total_runs,
+            "total_docs": total_docs,
+            "success_docs": success_docs,
+            "success_rate": success_rate,
+            "status_counts": status_counts,
+            "new_correspondents": new_correspondents,
+            "deleted_tags": deleted_tag_list,
+            "open_reviews": open_review_list,
+            "errors": error_list,
+        }
+
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -281,7 +372,7 @@ LLM_COMPACT_PROMPT_MAX_TAGS = int(os.getenv("LLM_COMPACT_PROMPT_MAX_TAGS", "24")
 LLM_VERIFY_ON_LOW_CONFIDENCE = os.getenv("LLM_VERIFY_ON_LOW_CONFIDENCE", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # --- Paperless-NGX ---
-OWNER_ID = 4  # Edgar
+OWNER_ID = int(os.getenv("OWNER_ID", "4"))
 
 # --- Erlaubte Dokumenttypen (20 Stueck) ---
 ALLOWED_DOC_TYPES = [
@@ -365,6 +456,7 @@ AUTOPILOT_START_WITH_AUTO_ORGANIZE = os.getenv("AUTOPILOT_START_WITH_AUTO_ORGANI
 AUTOPILOT_RECHECK_ALL_ON_START = os.getenv("AUTOPILOT_RECHECK_ALL_ON_START", "0").strip().lower() in ("1", "true", "yes", "on")
 AUTOPILOT_CLEANUP_EVERY_CYCLES = int(os.getenv("AUTOPILOT_CLEANUP_EVERY_CYCLES", "10"))
 AUTOPILOT_DUPLICATE_SCAN_EVERY_CYCLES = int(os.getenv("AUTOPILOT_DUPLICATE_SCAN_EVERY_CYCLES", "0"))
+AUTOPILOT_REVIEW_RESOLVE_EVERY_CYCLES = int(os.getenv("AUTOPILOT_REVIEW_RESOLVE_EVERY_CYCLES", "15"))
 AUTOPILOT_MAX_NEW_DOCS_PER_CYCLE = int(os.getenv("AUTOPILOT_MAX_NEW_DOCS_PER_CYCLE", "25"))
 WATCH_RECONNECT_ERROR_THRESHOLD = int(os.getenv("WATCH_RECONNECT_ERROR_THRESHOLD", "3"))
 WATCH_ERROR_BACKOFF_BASE_SEC = int(os.getenv("WATCH_ERROR_BACKOFF_BASE_SEC", "10"))
@@ -875,6 +967,9 @@ class LearningExamples:
                 if tag_name:
                     row["tags"][tag_name] += 1
 
+        # Merge similar correspondent names (e.g. "Baader Bank" + "Baader Bank AG")
+        grouped = self._merge_correspondent_variants(grouped)
+
         profiles = []
         for row in grouped.values():
             total = max(1, int(row["count"]))
@@ -899,6 +994,41 @@ class LearningExamples:
                 }
             )
         return profiles
+
+    @staticmethod
+    def _merge_correspondent_variants(grouped: dict[str, dict], threshold: float = 0.85) -> dict[str, dict]:
+        """Merge correspondent variants with similar names (e.g. 'Baader Bank' + 'Baader Bank AG')."""
+        keys = list(grouped.keys())
+        merged_into: dict[str, str] = {}  # maps absorbed key -> canonical key
+        for i, key_a in enumerate(keys):
+            if key_a in merged_into:
+                continue
+            for key_b in keys[i + 1:]:
+                if key_b in merged_into:
+                    continue
+                ratio = difflib.SequenceMatcher(None, key_a, key_b).ratio()
+                if ratio < threshold:
+                    continue
+                # Merge: keep the one with more samples as canonical
+                row_a = grouped[key_a]
+                row_b = grouped[key_b]
+                if row_a["count"] >= row_b["count"]:
+                    canonical_key, absorbed_key = key_a, key_b
+                else:
+                    canonical_key, absorbed_key = key_b, key_a
+                canon = grouped[canonical_key]
+                absorbed = grouped[absorbed_key]
+                canon["count"] += absorbed["count"]
+                for dt, cnt in absorbed["doc_types"].items():
+                    canon["doc_types"][dt] += cnt
+                for p, cnt in absorbed["paths"].items():
+                    canon["paths"][p] += cnt
+                for t, cnt in absorbed["tags"].items():
+                    canon["tags"][t] += cnt
+                merged_into[absorbed_key] = canonical_key
+        for absorbed_key in merged_into:
+            grouped.pop(absorbed_key, None)
+        return grouped
 
     def routing_hints_for_document(self, document: dict, limit: int = LEARNING_PRIOR_MAX_HINTS) -> list[dict]:
         """
@@ -1068,47 +1198,48 @@ class PaperlessClient:
         luminance = (0.299 * r) + (0.587 * g) + (0.114 * b)
         return "#000000" if luminance >= 170 else "#ffffff"
 
+    def _write_with_retry(self, method: str, url: str, data: dict, timeout: int = 30) -> requests.Response:
+        """Schreiboperation mit Retry bei transienten Fehlern."""
+        last_exc = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = getattr(self.session, method)(url, json=data, timeout=timeout)
+                resp.raise_for_status()
+                return resp
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError,
+                    requests.exceptions.ReadTimeout) as exc:
+                last_exc = exc
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise
+            except requests.exceptions.RequestException:
+                raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"Schreiboperation fehlgeschlagen: {method.upper()} {url}")
+
     def update_document(self, doc_id: int, data: dict) -> dict:
-        resp = self.session.patch(
-            f"{self.url}/api/documents/{doc_id}/",
-            json=data, timeout=30,
-        )
-        resp.raise_for_status()
+        resp = self._write_with_retry("patch", f"{self.url}/api/documents/{doc_id}/", data)
         return resp.json()
 
     def create_tag(self, name: str, color: str | None = None, text_color: str | None = None) -> dict:
         color = (color or self._next_color()).strip().lower()
         text_color = (text_color or self._text_color_for_background(color)).strip().lower()
         data = {"name": name, "color": color, "text_color": text_color}
-        resp = self.session.post(
-            f"{self.url}/api/tags/",
-            json=self._with_permissions(data), timeout=30,
-        )
-        resp.raise_for_status()
+        resp = self._write_with_retry("post", f"{self.url}/api/tags/", self._with_permissions(data))
         return resp.json()
 
     def create_correspondent(self, name: str) -> dict:
-        resp = self.session.post(
-            f"{self.url}/api/correspondents/",
-            json=self._with_permissions({"name": name}), timeout=30,
-        )
-        resp.raise_for_status()
+        resp = self._write_with_retry("post", f"{self.url}/api/correspondents/", self._with_permissions({"name": name}))
         return resp.json()
 
     def create_document_type(self, name: str) -> dict:
-        resp = self.session.post(
-            f"{self.url}/api/document_types/",
-            json=self._with_permissions({"name": name}), timeout=30,
-        )
-        resp.raise_for_status()
+        resp = self._write_with_retry("post", f"{self.url}/api/document_types/", self._with_permissions({"name": name}))
         return resp.json()
 
     def create_storage_path(self, name: str, path: str) -> dict:
-        resp = self.session.post(
-            f"{self.url}/api/storage_paths/",
-            json=self._with_permissions({"name": name, "path": path}), timeout=30,
-        )
-        resp.raise_for_status()
+        resp = self._write_with_retry("post", f"{self.url}/api/storage_paths/", self._with_permissions({"name": name, "path": path}))
         return resp.json()
 
     def get_next_asn(self) -> int:
@@ -1125,14 +1256,19 @@ class PaperlessClient:
 
     # --- Loeschen (einzeln mit Retry) ---
     def _delete_item(self, endpoint: str, item_id: int) -> bool:
+        last_exc = None
         for attempt in range(MAX_RETRIES):
             try:
                 resp = self.session.delete(
                     f"{self.url}/api/{endpoint}/{item_id}/", timeout=15,
                 )
+                if resp.status_code != 204:
+                    log.warning(f"DELETE {endpoint}/{item_id} unerwartet: Status {resp.status_code}")
                 return resp.status_code == 204
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                last_exc = exc
                 time.sleep(2 * (attempt + 1))
+        log.error(f"DELETE {endpoint}/{item_id} fehlgeschlagen nach {MAX_RETRIES} Versuchen: {last_exc}")
         return False
 
     def delete_tag(self, tag_id: int) -> bool:
@@ -1393,6 +1529,264 @@ def _fetch_entity_web_hint(entity: str) -> str:
     return result
 
 
+def _web_search_entity(entity: str, max_results: int = 3) -> str:
+    """Real web search via duckduckgo-search package with fallback to Instant Answers API."""
+    if not ENABLE_WEB_HINTS:
+        return ""
+    entity_clean = _normalize_text(entity)
+    if not entity_clean:
+        return ""
+    cache_key = f"websearch::{entity_clean.lower()}"
+    with WEB_HINT_CACHE_LOCK:
+        if cache_key in WEB_HINT_CACHE:
+            return WEB_HINT_CACHE[cache_key]
+    result = ""
+    try:
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            hits = list(ddgs.text(f"{entity_clean} Firma Unternehmen", max_results=max_results))
+        if hits:
+            parts = []
+            for hit in hits[:max_results]:
+                title = (hit.get("title") or "").strip()
+                body = (hit.get("body") or "").strip()
+                if title or body:
+                    parts.append(f"{title}: {body[:120]}")
+            if parts:
+                result = f"{entity_clean}: " + " | ".join(parts)
+    except ImportError:
+        # Fallback: use old DuckDuckGo Instant Answers API
+        result = _fetch_entity_web_hint(entity)
+    except Exception:
+        # Graceful fallback on any search error
+        try:
+            result = _fetch_entity_web_hint(entity)
+        except Exception:
+            result = ""
+    with WEB_HINT_CACHE_LOCK:
+        WEB_HINT_CACHE[cache_key] = result
+    return result
+
+
+# --- German month names for date parsing ---
+_GERMAN_MONTHS = {
+    "januar": 1, "februar": 2, "maerz": 3, "märz": 3, "april": 4,
+    "mai": 5, "juni": 6, "juli": 7, "august": 8, "september": 9,
+    "oktober": 10, "november": 11, "dezember": 12,
+    "jan": 1, "feb": 2, "mär": 3, "mar": 3, "apr": 4, "mai": 5,
+    "jun": 6, "jul": 7, "aug": 8, "sep": 9, "okt": 10, "nov": 11, "dez": 12,
+}
+
+
+def _extract_document_date(document: dict) -> str:
+    """Extract the most likely document date from content (German formats)."""
+    content = str(document.get("content") or "")
+    if not content:
+        return ""
+    # Check first 1500 chars where date usually appears
+    text = content[:1500]
+
+    # Pattern 1: dd.mm.yyyy (most common German format)
+    dates_dot = re.findall(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b", text)
+    # Pattern 2: dd. Monat yyyy
+    dates_named = re.findall(r"\b(\d{1,2})\.\s*([A-Za-zäöüÄÖÜ]+)\s+(\d{4})\b", text)
+    # Pattern 3: yyyy-mm-dd (ISO format)
+    dates_iso = re.findall(r"\b(\d{4})-(\d{2})-(\d{2})\b", text)
+
+    candidates = []
+    for day, month, year in dates_dot:
+        try:
+            d = datetime(int(year), int(month), int(day))
+            if 2000 <= d.year <= 2030:
+                candidates.append(d)
+        except (ValueError, OverflowError):
+            pass
+    for day, month_name, year in dates_named:
+        month_num = _GERMAN_MONTHS.get(month_name.lower())
+        if month_num:
+            try:
+                d = datetime(int(year), month_num, int(day))
+                if 2000 <= d.year <= 2030:
+                    candidates.append(d)
+            except (ValueError, OverflowError):
+                pass
+    for year, month, day in dates_iso:
+        try:
+            d = datetime(int(year), int(month), int(day))
+            if 2000 <= d.year <= 2030:
+                candidates.append(d)
+        except (ValueError, OverflowError):
+            pass
+
+    if not candidates:
+        return ""
+    # Return the most recent date (likely the document date, not some reference date)
+    best = max(candidates)
+    return best.strftime("%Y-%m-%d")
+
+
+def _assess_ocr_quality(document: dict) -> tuple[str, float]:
+    """Assess OCR quality of document content. Returns (quality_level, score) where quality_level is 'good', 'medium', or 'poor'."""
+    content = str(document.get("content") or "")
+    if not content:
+        return ("poor", 0.0)
+
+    total_chars = len(content)
+    if total_chars < 50:
+        return ("poor", 0.1)
+
+    # Count various quality indicators
+    alpha_chars = sum(1 for c in content if c.isalpha())
+    digit_chars = sum(1 for c in content if c.isdigit())
+    space_chars = sum(1 for c in content if c.isspace())
+    special_chars = total_chars - alpha_chars - digit_chars - space_chars
+
+    # Words check
+    words = content.split()
+    total_words = len(words)
+    if total_words < 5:
+        return ("poor", 0.15)
+
+    # Ratio of alphabetic characters (good OCR has high ratio)
+    alpha_ratio = alpha_chars / max(1, total_chars)
+    # Ratio of special characters (bad OCR has lots of garbage)
+    special_ratio = special_chars / max(1, total_chars)
+    # Average word length (very short = garbage, very long = merged words)
+    avg_word_len = sum(len(w) for w in words) / max(1, total_words)
+    # Count words that look like real words (3+ alpha chars)
+    real_words = sum(1 for w in words if len(w) >= 3 and sum(1 for c in w if c.isalpha()) >= 2)
+    real_word_ratio = real_words / max(1, total_words)
+
+    score = 0.0
+    score += min(0.3, alpha_ratio * 0.4)  # More alpha = better
+    score += min(0.2, (1.0 - special_ratio) * 0.25)  # Less special = better
+    score += min(0.2, real_word_ratio * 0.25)  # More real words = better
+    score += 0.15 if 3.0 <= avg_word_len <= 12.0 else 0.0  # Normal word length
+    score += 0.15 if total_words >= 20 else (0.07 if total_words >= 10 else 0.0)
+
+    if score >= 0.7:
+        return ("good", score)
+    elif score >= 0.4:
+        return ("medium", score)
+    else:
+        return ("poor", score)
+
+
+def _improve_title(title: str, document: dict) -> str:
+    """Clean up and improve LLM-generated titles."""
+    if not title:
+        return title
+    # Remove common file extensions the LLM might include
+    title = re.sub(r"\.(pdf|png|jpg|jpeg|tiff?)$", "", title, flags=re.IGNORECASE).strip()
+    # Remove leading/trailing quotes
+    title = title.strip("'\"")
+    # Remove "Dokument:" or similar prefixes
+    title = re.sub(r"^(Dokument|Document|Datei|File)\s*[:|-]\s*", "", title, flags=re.IGNORECASE).strip()
+    # Capitalize first letter
+    if title and title[0].islower():
+        title = title[0].upper() + title[1:]
+    # Truncate very long titles
+    if len(title) > 128:
+        title = title[:125] + "..."
+    return title
+
+
+def _content_fingerprint(content: str) -> set[int]:
+    """Create a set of trigram hashes for content similarity comparison (MinHash-like)."""
+    if not content:
+        return set()
+    # Normalize: lowercase, remove special chars, collapse whitespace
+    text = re.sub(r"[^a-z0-9äöüß\s]", " ", content.lower())
+    text = re.sub(r"\s+", " ", text).strip()
+    words = text.split()
+    if len(words) < 5:
+        return set()
+    # Create word trigrams and hash them
+    trigrams = set()
+    for i in range(len(words) - 2):
+        trigram = " ".join(words[i:i + 3])
+        trigrams.add(hash(trigram))
+    return trigrams
+
+
+def _content_similarity(fp_a: set[int], fp_b: set[int]) -> float:
+    """Jaccard similarity between two content fingerprints."""
+    if not fp_a or not fp_b:
+        return 0.0
+    intersection = len(fp_a & fp_b)
+    union = len(fp_a | fp_b)
+    return intersection / max(1, union)
+
+
+def _extract_document_entities(document: dict) -> list[str]:
+    """Extract potential entity names from document text (email domains, URLs, IBAN banks)."""
+    content = str(document.get("content") or "")
+    title = str(document.get("title") or "")
+    filename = str(document.get("original_file_name") or "")
+    # Use last 500 chars (often letterhead/footer) + first 500 chars + title + filename
+    text_parts = title + " " + filename + " " + content[:500] + " " + content[-500:] if len(content) > 500 else title + " " + filename + " " + content
+
+    entities = []
+    seen_norm = set()
+
+    def _add_entity(name: str):
+        norm = _normalize_tag_name(name)
+        if norm and norm not in seen_norm and len(name) > 2:
+            seen_norm.add(norm)
+            entities.append(name)
+
+    # Email domains -> company name
+    for match in re.finditer(r"@([a-z0-9.-]+\.[a-z]{2,})", text_parts, re.IGNORECASE):
+        domain = match.group(1).lower()
+        # Skip generic email providers
+        if domain.split(".")[-2] in ("gmail", "gmx", "yahoo", "outlook", "hotmail", "web", "t-online", "posteo", "protonmail"):
+            continue
+        # Extract company name from domain (e.g. "scalable.capital" -> "scalable capital")
+        company = domain.rsplit(".", 1)[0].replace(".", " ").replace("-", " ").strip()
+        if company:
+            _add_entity(company)
+
+    # URLs -> domain -> company name
+    for match in re.finditer(r"https?://(?:www\.)?([a-z0-9.-]+\.[a-z]{2,})", text_parts, re.IGNORECASE):
+        domain = match.group(1).lower()
+        company = domain.rsplit(".", 1)[0].replace(".", " ").replace("-", " ").strip()
+        if company and len(company) > 2:
+            _add_entity(company)
+
+    # IBAN pattern -> search for the bank
+    for match in re.finditer(r"\b([A-Z]{2}\d{2}\s?\d{4}\s?\d{4}\s?\d{4}\s?\d{4}\s?\d{0,4}\s?\d{0,2})\b", text_parts):
+        iban = match.group(1).replace(" ", "")
+        if len(iban) >= 16:
+            # Use BLZ (digits 5-12 for DE IBANs) as search term
+            if iban[:2] == "DE" and len(iban) >= 12:
+                blz = iban[4:12]
+                _add_entity(f"Bank BLZ {blz}")
+                break  # Only search for one IBAN
+
+    return entities[:4]  # Limit to avoid too many searches
+
+
+def _web_search_document_context(document: dict) -> str:
+    """Build web search context for unrecognized documents by searching for extracted entities."""
+    if not ENABLE_WEB_HINTS:
+        return ""
+    entities = _extract_document_entities(document)
+    if not entities:
+        return ""
+
+    results = []
+    for entity in entities[:WEB_HINT_MAX_ENTITIES]:
+        hint = _web_search_entity(entity)
+        if hint:
+            results.append(hint)
+    if not results:
+        return ""
+    return "WEBSUCHE: " + " | ".join(results)
+
+
 def build_decision_context(documents: list, correspondents: list, storage_paths: list,
                            learning_profile: LearningProfile | None = None) -> DecisionContext:
     """
@@ -1479,7 +1873,7 @@ def _collect_web_entity_hints(document: dict, current_corr: str = "") -> str:
         if not norm or norm in seen:
             continue
         seen.add(norm)
-        hint = _fetch_entity_web_hint(candidate)
+        hint = _web_search_entity(candidate)
         if hint:
             hints.append(hint)
         if len(hints) >= WEB_HINT_MAX_ENTITIES:
@@ -1781,13 +2175,111 @@ def _apply_learning_guardrails(suggestion: dict, storage_paths: list, learning_h
             tags_now.append(tag)
             tags_now_norm.add(norm)
             added_tags += 1
-            if added_tags >= 1:
+            if added_tags >= 2:
                 break
         if added_tags:
             suggestion["tags"] = tags_now
             corrections.append(f"tags+{added_tags} (learning prior)")
 
     return corrections
+
+
+RULE_BASED_MIN_SAMPLES = int(os.getenv("RULE_BASED_MIN_SAMPLES", "10"))
+RULE_BASED_MIN_RATIO = float(os.getenv("RULE_BASED_MIN_RATIO", "0.80"))
+
+
+def _try_rule_based_suggestion(document: dict, learning_hints: list[dict],
+                               storage_paths: list) -> dict | None:
+    """Fast path: skip LLM entirely for well-known correspondent patterns (10+ samples, >80% consistent)."""
+    if not ENABLE_LEARNING_PRIORS or not learning_hints:
+        return None
+    best = learning_hints[0]
+    count = int(best.get("count", 0) or 0)
+    if count < RULE_BASED_MIN_SAMPLES:
+        return None
+
+    corr = _normalize_text(str(best.get("correspondent", "")))
+    if not corr:
+        return None
+
+    type_ratio = float(best.get("document_type_ratio", 0.0) or 0.0)
+    path_ratio = float(best.get("storage_path_ratio", 0.0) or 0.0)
+
+    # Only use rule-based if BOTH doc_type and path are highly consistent
+    if type_ratio < RULE_BASED_MIN_RATIO or path_ratio < RULE_BASED_MIN_RATIO:
+        return None
+
+    top_type = _normalize_text(str(best.get("top_document_type", "")))
+    top_path = _normalize_text(str(best.get("top_storage_path", "")))
+    if not top_type or not top_path:
+        return None
+
+    safe_path = _pick_existing_storage_path(storage_paths, [top_path])
+    if not safe_path:
+        return None
+
+    top_tags = [str(t) for t in (best.get("top_tags") or []) if _normalize_text(str(t))]
+    tag_ratios = best.get("tag_ratios") or {}
+    rule_tags = []
+    for tag in top_tags:
+        ratio = float(tag_ratios.get(tag, 0.0) or 0.0)
+        if ratio >= RULE_BASED_MIN_RATIO and len(rule_tags) < MAX_TAGS_PER_DOC:
+            rule_tags.append(tag)
+
+    return {
+        "correspondent": corr,
+        "title": document.get("title", ""),
+        "document_type": top_type,
+        "storage_path": safe_path,
+        "tags": rule_tags or [],
+        "confidence": "rule_based",
+        "reasoning": f"Regelbasiert: {count} Beispiele, Typ {type_ratio:.0%}, Pfad {path_ratio:.0%}",
+    }
+
+
+def _build_suggestion_from_priors(document: dict, learning_hints: list[dict],
+                                  storage_paths: list) -> dict | None:
+    """Baut aus Learning-Priors eine Suggestion OHNE LLM-Aufruf (Fallback)."""
+    if not learning_hints:
+        return None
+    best = learning_hints[0]
+    count = int(best.get("count", 0) or 0)
+    if count < LEARNING_PRIOR_MIN_SAMPLES:
+        return None
+
+    corr = _normalize_text(str(best.get("correspondent", "")))
+    if not corr:
+        return None
+
+    suggestion: dict = {
+        "correspondent": corr,
+        "title": document.get("title", ""),
+        "confidence": "prior_only",
+    }
+
+    top_type = _normalize_text(str(best.get("top_document_type", "")))
+    type_ratio = float(best.get("document_type_ratio", 0.0) or 0.0)
+    if top_type and type_ratio >= 0.60:
+        suggestion["document_type"] = top_type
+
+    top_path = _normalize_text(str(best.get("top_storage_path", "")))
+    path_ratio = float(best.get("storage_path_ratio", 0.0) or 0.0)
+    if top_path and path_ratio >= 0.60:
+        safe_path = _pick_existing_storage_path(storage_paths, [top_path])
+        if safe_path:
+            suggestion["storage_path"] = safe_path
+
+    top_tags = [str(t) for t in (best.get("top_tags") or []) if _normalize_text(str(t))]
+    tag_ratios = best.get("tag_ratios") or {}
+    prior_tags = []
+    for tag in top_tags:
+        ratio = float(tag_ratios.get(tag, 0.0) or 0.0)
+        if ratio >= 0.50 and len(prior_tags) < MAX_TAGS_PER_DOC:
+            prior_tags.append(tag)
+    if prior_tags:
+        suggestion["tags"] = prior_tags
+
+    return suggestion
 
 
 def _select_controlled_tags(suggested_tags: list, existing_tags: list, taxonomy: TagTaxonomy | None = None,
@@ -1894,6 +2386,7 @@ def _resolve_path_id(path_value: str, storage_paths: list) -> int | None:
 def _collect_hard_review_reasons(document: dict, suggestion: dict, selected_tags: list, storage_paths: list,
                                  decision_context: DecisionContext | None = None) -> list[str]:
     reasons = []
+    is_prior_only = str(suggestion.get("confidence", "")).strip().lower() == "prior_only"
     confidence = str(suggestion.get("confidence", "high")).strip().lower()
     if REVIEW_ON_MEDIUM_CONFIDENCE and confidence in ("low", "medium"):
         reasons.append(f"confidence={confidence}")
@@ -1903,7 +2396,8 @@ def _collect_hard_review_reasons(document: dict, suggestion: dict, selected_tags
 
     doc_type = _normalize_text(suggestion.get("document_type", ""))
     if not doc_type and not document.get("document_type"):
-        reasons.append("kein Dokumenttyp")
+        if not is_prior_only:
+            reasons.append("kein Dokumenttyp")
     elif doc_type and doc_type.lower() not in {t.lower() for t in ALLOWED_DOC_TYPES} and not document.get("document_type"):
         reasons.append(f"dokumenttyp-unbekannt:{doc_type}")
 
@@ -1912,7 +2406,8 @@ def _collect_hard_review_reasons(document: dict, suggestion: dict, selected_tags
 
     path_value = _normalize_text(suggestion.get("storage_path", ""))
     if not path_value and not document.get("storage_path"):
-        reasons.append("kein Speicherpfad")
+        if not is_prior_only:
+            reasons.append("kein Speicherpfad")
     elif path_value and _resolve_path_id(path_value, storage_paths) is None and not ALLOW_NEW_STORAGE_PATHS and not document.get("storage_path"):
         reasons.append(f"speicherpfad-unbekannt:{path_value}")
 
@@ -1928,6 +2423,11 @@ def _collect_hard_review_reasons(document: dict, suggestion: dict, selected_tags
         reasons.append(f"anbieter-arbeitskonflikt:{vendor_key}")
     if vendor_key and path_value.lower().startswith("arbeit/"):
         reasons.append(f"anbieter-arbeitsordner:{vendor_key}")
+
+    # OCR quality check - flag poor OCR for review
+    ocr_quality, _ = _assess_ocr_quality(document)
+    if ocr_quality == "poor" and not is_prior_only:
+        reasons.append("ocr-qualitaet-schlecht")
 
     return reasons
 
@@ -2169,7 +2669,8 @@ class LocalLLMAnalyzer:
                 few_shot_examples: list[dict] | None = None,
                 learning_hints: list[dict] | None = None,
                 compact_mode: bool = False,
-                read_timeout_override: int | None = None) -> dict:
+                read_timeout_override: int | None = None,
+                web_hint_override: str | None = None) -> dict:
         """Analysiert ein Dokument und gibt Organisationsvorschlag zurueck."""
 
         # Top-Korrespondenten nach Dokumentanzahl (Token sparen)
@@ -2221,9 +2722,19 @@ class LocalLLMAnalyzer:
                 content_preview = content
 
         brand_hint = _get_brand_hint(f"{document.get('title', '')} {document.get('original_file_name', '')} {content_preview[:1000]}")
-        web_hint_primary = _fetch_web_hint(document.get("title", ""), content_preview) if (ENABLE_WEB_HINTS and not compact_mode) else ""
-        web_hint_entities = _collect_web_entity_hints(document, current_corr=current_corr) if (ENABLE_WEB_HINTS and not compact_mode) else ""
-        web_hint = " | ".join([h for h in [web_hint_primary, web_hint_entities] if h])
+        if web_hint_override:
+            web_hint = web_hint_override
+        elif ENABLE_WEB_HINTS and not compact_mode:
+            # Use real web search for entity hints, keep old primary hint as supplement
+            web_hint_primary = _fetch_web_hint(document.get("title", ""), content_preview)
+            web_hint_entities = _collect_web_entity_hints(document, current_corr=current_corr)
+            # Also try real web search for the current correspondent if unknown
+            web_search_corr = ""
+            if current_corr and current_corr not in KNOWN_BRAND_HINTS:
+                web_search_corr = _web_search_entity(current_corr)
+            web_hint = " | ".join([h for h in [web_hint_primary, web_hint_entities, web_search_corr] if h])
+        else:
+            web_hint = ""
 
         if decision_context:
             employer_list = sorted(decision_context.employer_names)[:max(1, MAX_CONTEXT_EMPLOYER_HINTS)]
@@ -2279,10 +2790,11 @@ class LocalLLMAnalyzer:
         path_names = [p["name"] for p in existing_paths if "Duplikat" not in p["name"]]
         if compact_mode:
             path_names = path_names[:max(8, LLM_COMPACT_PROMPT_MAX_PATHS)]
-            prompt = f"""Paperless-NGX: Dokument kurz zuordnen.
+            prompt = f"""Paperless-NGX: Dokument klassifizieren und zuordnen.
 DOKUMENT #{document['id']}:
 Titel: {document.get('title', '?')} | Datei: {document.get('original_file_name', '?')}
 Aktuell: Tags={current_tags or 'keine'} | Korr={current_corr or 'keiner'} | Typ={current_type or 'keiner'} | Pfad={current_path or 'keiner'}
+{f'WEB-KONTEXT: {web_hint}' if web_hint else ''}
 
 INHALT (AUSZUG):
 {content_preview}
@@ -2292,15 +2804,17 @@ ERLAUBTE DOKUMENTTYPEN: {', '.join(ALLOWED_DOC_TYPES)}
 ERLAUBTE SPEICHERPFADE: {', '.join(path_names)}
 ERLAUBTE TAGS: {', '.join(tag_choices)}
 
-REGELN:
-- Korrespondent = konkreter Absender im Dokument.
-- Keine neuen Tags erfinden, max {MAX_TAGS_PER_DOC} Tags.
-- storage_path muss exakt aus der Liste sein.
-- Wenn unsicher: bestehenden Korrespondenten beibehalten.
-- confidence nur: high, medium, low.
+FELDER (alle Pflichtfelder):
+- title: Aussagekraeftiger deutscher Titel (z.B. "Rechnung Telekom Februar 2025")
+- correspondent: Der KONKRETE Absender (Firma/Behoerde) aus dem Briefkopf, MUSS aus der Liste sein
+- document_type: Dokumenttyp (z.B. Rechnung, Kontoauszug, Vertrag), MUSS aus der Liste sein
+- storage_path: Kategorie-Pfad EXAKT aus der Liste (z.B. "Finanzen/Bank")
+- tags: 1-{MAX_TAGS_PER_DOC} Tags NUR aus der Liste, keine neuen erfinden
+- confidence: "high" (sicher), "medium" (wahrscheinlich), "low" (unsicher)
+- reasoning: Kurze Begruendung
 
 NUR JSON:
-{{"title": "Titel", "tags": ["Tag1", "Tag2"], "correspondent": "Firma", "document_type": "Typ", "storage_path_name": "Kategorie", "storage_path": "Kategorie/Sub", "confidence": "high", "reasoning": "Kurz"}}"""
+{{"title": "Titel", "tags": ["Tag1"], "correspondent": "Firma", "document_type": "Typ", "storage_path_name": "Kategorie", "storage_path": "Kategorie/Sub", "confidence": "high", "reasoning": "Kurz"}}"""
         else:
             prompt = f"""Paperless-NGX Dokument organisieren.
 {profile_context}
@@ -2375,15 +2889,21 @@ NUR JSON, kein anderer Text:
             max_tokens=LLM_COMPACT_MAX_TOKENS if compact_mode else LLM_MAX_TOKENS,
         )
 
-        # JSON parsen - bei Fehler Retry mit strengerem Prompt
+        # JSON parsen - bei Fehler Retry mit Reasoning-Prompt
         try:
             suggestion = self._parse_json_response(response)
         except (json.JSONDecodeError, ValueError):
-            log.info("[yellow]JSON-Parse-Fehler, versuche erneut...[/yellow]")
+            log.info("[yellow]JSON-Parse-Fehler, Retry mit Reasoning-Prompt...[/yellow]")
             retry_prompt = (
+                "Analysiere das folgende Dokument Schritt fuer Schritt:\n"
+                "1. Wer ist der Absender/Korrespondent?\n"
+                "2. Welcher Dokumenttyp passt am besten?\n"
+                "3. In welchen Speicherpfad gehoert es?\n"
+                "4. Welche Tags sind relevant?\n"
+                "5. Wie sicher bist du dir?\n\n"
                 f"{prompt}\n\n"
                 "WICHTIG: Antworte AUSSCHLIESSLICH mit einem einzigen JSON-Objekt. "
-                "Kein Text davor oder danach. Keine Markdown-Formatierung."
+                "Kein Text davor oder danach."
             )
             response = self._call_llm(
                 retry_prompt,
@@ -2463,6 +2983,20 @@ Antworte NUR mit korrigiertem JSON (oder identischem wenn alles stimmt):
                 "options": {
                     "temperature": LLM_TEMPERATURE,
                     "num_predict": token_limit,
+                },
+                "format": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "correspondent": {"type": "string"},
+                        "document_type": {"type": "string"},
+                        "storage_path_name": {"type": "string"},
+                        "storage_path": {"type": "string"},
+                        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                        "reasoning": {"type": "string"},
+                    },
+                    "required": ["title", "tags", "correspondent", "document_type", "storage_path", "confidence"],
                 },
             }
             if self.model:
@@ -2860,102 +3394,33 @@ def process_document(doc_id: int, paperless: PaperlessClient,
     content_len = len(document.get('content') or '')
     log.info(f"  Geladen: [white]{doc_title}[/white] ({content_len} Zeichen)")
 
-    log.info(f"  LLM-Analyse laeuft... (Modell: {analyzer.model})")
+    # OCR quality check
+    ocr_quality, ocr_score = _assess_ocr_quality(document)
+    if ocr_quality == "poor":
+        log.warning(f"  [yellow]OCR-Qualitaet schlecht[/yellow] (Score: {ocr_score:.2f}) - Ergebnis koennte ungenau sein")
+    elif ocr_quality == "medium":
+        log.info(f"  OCR-Qualitaet: mittel (Score: {ocr_score:.2f})")
+
     few_shot_examples = learning_examples.select(document, limit=LEARNING_EXAMPLE_LIMIT) if learning_examples else []
     learning_hints = (
         learning_examples.routing_hints_for_document(document, limit=LEARNING_PRIOR_MAX_HINTS)
         if learning_examples else []
     )
+
+    # Rule-based fast path: skip LLM for well-known correspondent patterns
+    rule_suggestion = _try_rule_based_suggestion(document, learning_hints, storage_paths)
+    if rule_suggestion:
+        log.info(f"  [green]Regelbasiert[/green] (LLM uebersprungen): {rule_suggestion.get('correspondent')}")
+        if run_db and run_id:
+            run_db.record_document(run_id, doc_id, "rule_based", document, suggestion=rule_suggestion)
+        suggestion = rule_suggestion
+        # Jump straight to guardrails/validation below
+    else:
+        log.info(f"  LLM-Analyse laeuft... (Modell: {analyzer.model})")
+
     initial_compact = bool(prefer_compact)
     t_start = time.perf_counter()
-    try:
-        suggestion = analyzer.analyze(
-            document,
-            tags,
-            correspondents,
-            doc_types,
-            storage_paths,
-            taxonomy=taxonomy,
-            decision_context=decision_context,
-            few_shot_examples=[] if initial_compact else few_shot_examples,
-            learning_hints=learning_hints,
-            compact_mode=initial_compact,
-        )
-    except json.JSONDecodeError as e:
-        log.error(f"  JSON-Parse-Fehler: {e}")
-        if run_db and run_id:
-            run_db.record_document(run_id, doc_id, "error_json", document, error=str(e))
-        return False
-    except requests.exceptions.Timeout:
-        if initial_compact:
-            retry_timeout = max(LLM_COMPACT_TIMEOUT_RETRY, LLM_COMPACT_TIMEOUT + 10)
-            log.warning(
-                f"  Timeout im Kompaktmodus ({LLM_COMPACT_TIMEOUT}s) - Retry mit erweitertem Kompakt-Timeout "
-                f"({retry_timeout}s)..."
-            )
-            try:
-                suggestion = analyzer.analyze(
-                    document,
-                    tags,
-                    correspondents,
-                    doc_types,
-                    storage_paths,
-                    taxonomy=taxonomy,
-                    decision_context=decision_context,
-                    few_shot_examples=[],
-                    learning_hints=learning_hints,
-                    compact_mode=True,
-                    read_timeout_override=retry_timeout,
-                )
-            except requests.exceptions.Timeout:
-                log.error(f"  Timeout im Kompaktmodus: LLM hat zu lange gebraucht (Server: {analyzer.url}).")
-                if run_db and run_id:
-                    run_db.record_document(run_id, doc_id, "error_timeout", document, error="llm timeout compact")
-                return False
-            except Exception as compact_retry_exc:
-                log.error(f"  Fehler im erweiterten Kompakt-Retry: {compact_retry_exc}")
-                if run_db and run_id:
-                    run_db.record_document(run_id, doc_id, "error_generic", document, error=str(compact_retry_exc))
-                return False
-        else:
-            log.warning(
-                f"  Timeout beim ersten Versuch ({LLM_TIMEOUT}s) - Kompakt-Retry ohne Few-Shot ({LLM_COMPACT_TIMEOUT}s)..."
-            )
-            try:
-                suggestion = analyzer.analyze(
-                    document,
-                    tags,
-                    correspondents,
-                    doc_types,
-                    storage_paths,
-                    taxonomy=taxonomy,
-                    decision_context=decision_context,
-                    few_shot_examples=[],
-                    learning_hints=learning_hints,
-                    compact_mode=True,
-                )
-            except requests.exceptions.Timeout:
-                if _is_fully_organized(document):
-                    log.warning("  Timeout im Recheck - bestehende Zuordnung bleibt unveraendert.")
-                    if run_db and run_id:
-                        run_db.record_document(run_id, doc_id, "timeout_kept_existing", document, error="llm timeout recheck")
-                    return False
-                log.error(f"  Timeout: LLM hat zu lange gebraucht (Server: {analyzer.url}).")
-                if run_db and run_id:
-                    run_db.record_document(run_id, doc_id, "error_timeout", document, error="llm timeout")
-                return False
-            except json.JSONDecodeError as e:
-                log.error(f"  JSON-Parse-Fehler nach Kompakt-Retry: {e}")
-                if run_db and run_id:
-                    run_db.record_document(run_id, doc_id, "error_json", document, error=str(e))
-                return False
-            except Exception as e:
-                log.error(f"  Fehler nach Kompakt-Retry: {e}")
-                if run_db and run_id:
-                    run_db.record_document(run_id, doc_id, "error_generic", document, error=str(e))
-                return False
-    except requests.exceptions.ConnectionError:
-        log.warning("  Verbindungsfehler beim ersten Versuch - Kompakt-Retry ohne Few-Shot...")
+    if suggestion is None:
         try:
             suggestion = analyzer.analyze(
                 document,
@@ -2965,29 +3430,185 @@ def process_document(doc_id: int, paperless: PaperlessClient,
                 storage_paths,
                 taxonomy=taxonomy,
                 decision_context=decision_context,
-                few_shot_examples=[],
+                few_shot_examples=[] if initial_compact else few_shot_examples,
                 learning_hints=learning_hints,
-                compact_mode=True,
+                compact_mode=initial_compact,
             )
-        except requests.exceptions.RequestException:
-            log.error(f"  LLM nicht erreichbar! Endpoint: {analyzer.url}")
+        except json.JSONDecodeError as e:
+            log.error(f"  JSON-Parse-Fehler: {e}")
             if run_db and run_id:
-                run_db.record_document(run_id, doc_id, "error_llm_connection", document, error="llm connection failed")
-            return False
+                run_db.record_document(run_id, doc_id, "error_json", document, error=str(e))
+            suggestion = None
+        except requests.exceptions.Timeout:
+            if initial_compact:
+                retry_timeout = max(LLM_COMPACT_TIMEOUT_RETRY, LLM_COMPACT_TIMEOUT + 10)
+                log.warning(
+                    f"  Timeout im Kompaktmodus ({LLM_COMPACT_TIMEOUT}s) - Retry mit erweitertem Kompakt-Timeout "
+                    f"({retry_timeout}s)..."
+                )
+                try:
+                    suggestion = analyzer.analyze(
+                        document,
+                        tags,
+                        correspondents,
+                        doc_types,
+                        storage_paths,
+                        taxonomy=taxonomy,
+                        decision_context=decision_context,
+                        few_shot_examples=[],
+                        learning_hints=learning_hints,
+                        compact_mode=True,
+                        read_timeout_override=retry_timeout,
+                    )
+                except requests.exceptions.Timeout:
+                    log.error(f"  Timeout im Kompaktmodus: LLM hat zu lange gebraucht (Server: {analyzer.url}).")
+                    if run_db and run_id:
+                        run_db.record_document(run_id, doc_id, "error_timeout", document, error="llm timeout compact")
+                    suggestion = None
+                except Exception as compact_retry_exc:
+                    log.error(f"  Fehler im erweiterten Kompakt-Retry: {compact_retry_exc}")
+                    if run_db and run_id:
+                        run_db.record_document(run_id, doc_id, "error_generic", document, error=str(compact_retry_exc))
+                    suggestion = None
+            else:
+                log.warning(
+                    f"  Timeout beim ersten Versuch ({LLM_TIMEOUT}s) - Kompakt-Retry ohne Few-Shot ({LLM_COMPACT_TIMEOUT}s)..."
+                )
+                try:
+                    suggestion = analyzer.analyze(
+                        document,
+                        tags,
+                        correspondents,
+                        doc_types,
+                        storage_paths,
+                        taxonomy=taxonomy,
+                        decision_context=decision_context,
+                        few_shot_examples=[],
+                        learning_hints=learning_hints,
+                        compact_mode=True,
+                    )
+                except requests.exceptions.Timeout:
+                    if _is_fully_organized(document):
+                        log.warning("  Timeout im Recheck - bestehende Zuordnung bleibt unveraendert.")
+                        if run_db and run_id:
+                            run_db.record_document(run_id, doc_id, "timeout_kept_existing", document, error="llm timeout recheck")
+                        return False
+                    log.error(f"  Timeout: LLM hat zu lange gebraucht (Server: {analyzer.url}).")
+                    if run_db and run_id:
+                        run_db.record_document(run_id, doc_id, "error_timeout", document, error="llm timeout")
+                    suggestion = None
+                except json.JSONDecodeError as e:
+                    log.error(f"  JSON-Parse-Fehler nach Kompakt-Retry: {e}")
+                    if run_db and run_id:
+                        run_db.record_document(run_id, doc_id, "error_json", document, error=str(e))
+                    suggestion = None
+                except Exception as e:
+                    log.error(f"  Fehler nach Kompakt-Retry: {e}")
+                    if run_db and run_id:
+                        run_db.record_document(run_id, doc_id, "error_generic", document, error=str(e))
+                    suggestion = None
+        except requests.exceptions.ConnectionError:
+            log.warning("  Verbindungsfehler beim ersten Versuch - Kompakt-Retry ohne Few-Shot...")
+            try:
+                suggestion = analyzer.analyze(
+                    document,
+                    tags,
+                    correspondents,
+                    doc_types,
+                    storage_paths,
+                    taxonomy=taxonomy,
+                    decision_context=decision_context,
+                    few_shot_examples=[],
+                    learning_hints=learning_hints,
+                    compact_mode=True,
+                )
+            except requests.exceptions.RequestException:
+                log.error(f"  LLM nicht erreichbar! Endpoint: {analyzer.url}")
+                if run_db and run_id:
+                    run_db.record_document(run_id, doc_id, "error_llm_connection", document, error="llm connection failed")
+                suggestion = None
+            except Exception as e:
+                log.error(f"  Fehler nach Verbindungs-Retry: {e}")
+                if run_db and run_id:
+                    run_db.record_document(run_id, doc_id, "error_generic", document, error=str(e))
+                suggestion = None
         except Exception as e:
-            log.error(f"  Fehler nach Verbindungs-Retry: {e}")
+            log.error(f"  Fehler: {e}")
             if run_db and run_id:
                 run_db.record_document(run_id, doc_id, "error_generic", document, error=str(e))
-            return False
-    except Exception as e:
-        log.error(f"  Fehler: {e}")
-        if run_db and run_id:
-            run_db.record_document(run_id, doc_id, "error_generic", document, error=str(e))
+            suggestion = None
+
+    # Fallback-Kette: LLM fehlgeschlagen -> Websuche + LLM Retry -> Learning-Priors
+    if suggestion is None and ENABLE_WEB_HINTS:
+        web_context = _web_search_document_context(document)
+        if web_context:
+            log.info("  [cyan]Websuche-Fallback aktiv[/cyan] - erneuter LLM-Versuch mit Web-Kontext")
+            try:
+                suggestion = analyzer.analyze(
+                    document, tags, correspondents, doc_types, storage_paths,
+                    taxonomy=taxonomy,
+                    decision_context=decision_context,
+                    few_shot_examples=[],
+                    learning_hints=learning_hints,
+                    compact_mode=True,
+                    web_hint_override=web_context,
+                )
+            except Exception:
+                suggestion = None
+
+    if suggestion is None and learning_hints:
+        suggestion = _build_suggestion_from_priors(document, learning_hints, storage_paths)
+        if suggestion:
+            log.info("  [cyan]Learning-Prior Fallback aktiv[/cyan] (LLM nicht verfuegbar)")
+            if run_db and run_id:
+                run_db.record_document(run_id, doc_id, "prior_fallback", document, suggestion=suggestion)
+    if suggestion is None:
         return False
 
     t_elapsed = time.perf_counter() - t_start
     log.info(f"  LLM-Antwort erhalten ({t_elapsed:.1f}s) -> Titel: [green]{suggestion.get('title', '?')}[/green]")
+
+    # E5: Low-confidence + no correspondent -> web search verification
+    confidence = (suggestion.get("confidence") or "high").lower()
+    corr_now = _normalize_text(str(suggestion.get("correspondent", "")))
+    if (
+        ENABLE_WEB_HINTS
+        and confidence == "low"
+        and not corr_now
+        and suggestion.get("confidence") != "prior_only"
+    ):
+        web_context = _web_search_document_context(document)
+        if web_context:
+            log.info("  [cyan]Websuche-Verifikation[/cyan] (low confidence, kein Korrespondent)")
+            try:
+                verified = analyzer.analyze(
+                    document, tags, correspondents, doc_types, storage_paths,
+                    taxonomy=taxonomy,
+                    decision_context=decision_context,
+                    few_shot_examples=[],
+                    learning_hints=learning_hints,
+                    compact_mode=True,
+                    web_hint_override=web_context,
+                )
+                if verified and _normalize_text(str(verified.get("correspondent", ""))):
+                    suggestion = verified
+                    log.info(f"  [green]Websuche-Verifikation erfolgreich[/green]: Korr={verified.get('correspondent')}")
+            except Exception:
+                pass  # Keep original suggestion on error
+
     _sanitize_suggestion_spelling(suggestion)
+
+    # Improve title
+    orig_title = suggestion.get("title", "")
+    improved_title = _improve_title(orig_title, document)
+    if improved_title and improved_title != orig_title:
+        suggestion["title"] = improved_title
+
+    # Extract document date if not already set
+    doc_date = _extract_document_date(document)
+    if doc_date and not document.get("created"):
+        suggestion["created_date"] = doc_date
+        log.info(f"  [cyan]Datum extrahiert[/cyan]: {doc_date}")
 
     guardrail_fixes = _apply_vendor_guardrails(
         document,
@@ -3856,12 +4477,46 @@ def find_duplicates(paperless: PaperlessClient):
     else:
         console.print("\n[green]Keine Titel-Duplikate gefunden.[/green]")
 
+    # Content-Fingerprint: near-duplicate detection
+    console.print("\n[bold]Inhalts-Aehnlichkeit (Fingerprint-Analyse)...[/bold]")
+    content_dupes = []
+    fingerprints = []
+    for d in docs:
+        fp = _content_fingerprint(str(d.get("content") or "")[:3000])
+        if fp:
+            fingerprints.append((d, fp))
+    # Compare all pairs (for small collections; skip if too many docs)
+    if len(fingerprints) <= 2000:
+        for i in range(len(fingerprints)):
+            for j in range(i + 1, len(fingerprints)):
+                sim = _content_similarity(fingerprints[i][1], fingerprints[j][1])
+                if sim >= 0.75:
+                    doc_a, doc_b = fingerprints[i][0], fingerprints[j][0]
+                    content_dupes.append((sim, doc_a, doc_b))
+        content_dupes.sort(key=lambda x: x[0], reverse=True)
+        if content_dupes:
+            console.print(f"\n[bold]Inhalts-Aehnlichkeit: {len(content_dupes)} Paare (>=75%)[/bold]")
+            for sim, doc_a, doc_b in content_dupes[:20]:
+                console.print(
+                    f"  [yellow]{sim:.0%}[/yellow] aehnlich: "
+                    f"#{doc_a['id']} '{doc_a.get('title', '?')[:40]}' <-> "
+                    f"#{doc_b['id']} '{doc_b.get('title', '?')[:40]}'"
+                )
+            if len(content_dupes) > 20:
+                console.print(f"  ... und {len(content_dupes) - 20} weitere Paare")
+        else:
+            console.print("[green]Keine inhaltsaehnlichen Dokumente gefunden.[/green]")
+    else:
+        console.print(f"  [yellow]Zu viele Dokumente ({len(fingerprints)}) fuer Fingerprint-Vergleich - uebersprungen[/yellow]")
+        content_dupes = []
+
     # Zusammenfassung
     console.print(f"\n[bold]Zusammenfassung:[/bold]")
     console.print(f"  Dateiname-Duplikate: {len(filename_dupes)} Gruppen ({sum(len(v) for v in filename_dupes.values())} Dokumente)")
     console.print(f"  Titel-Duplikate: {len(title_dupes)} Gruppen ({sum(len(v) for v in title_dupes.values())} Dokumente)")
+    console.print(f"  Inhalts-Aehnlichkeit: {len(content_dupes)} Paare")
     console.print("[red]Es wurden KEINE Dokumente geloescht![/red]")
-    log.info(f"  DUPLIKAT-SCAN fertig - {len(filename_dupes)} Dateiname-Gruppen, {len(title_dupes)} Titel-Gruppen")
+    log.info(f"  DUPLIKAT-SCAN fertig - {len(filename_dupes)} Dateiname-Gruppen, {len(title_dupes)} Titel-Gruppen, {len(content_dupes)} Inhalts-Paare")
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -3930,6 +4585,255 @@ def show_statistics(paperless: PaperlessClient):
         for c in top_corrs:
             table4.add_row(c["name"], str(c.get("document_count", 0)))
         console.print(table4)
+
+    # Learning-System Statistiken
+    try:
+        learning_examples = LearningExamples(LEARNING_EXAMPLES_FILE)
+        profiles = learning_examples._build_correspondent_profiles()
+        total_examples = len(learning_examples._examples)
+        total_profiles = len(profiles)
+        rule_based_ready = sum(1 for p in profiles if p.get("count", 0) >= RULE_BASED_MIN_SAMPLES
+                               and p.get("document_type_ratio", 0) >= RULE_BASED_MIN_RATIO
+                               and p.get("storage_path_ratio", 0) >= RULE_BASED_MIN_RATIO)
+        prior_ready = sum(1 for p in profiles if p.get("count", 0) >= LEARNING_PRIOR_MIN_SAMPLES)
+        low_sample = sum(1 for p in profiles if p.get("count", 0) < LEARNING_PRIOR_MIN_SAMPLES)
+
+        table5 = Table(title="Learning-System", show_header=True, width=60)
+        table5.add_column("Metrik", style="cyan")
+        table5.add_column("Wert", justify="right", style="bold")
+        table5.add_row("Gespeicherte Beispiele", str(total_examples))
+        table5.add_row("Korrespondenten-Profile", str(total_profiles))
+        table5.add_row(f"Regelbasiert bereit (>={RULE_BASED_MIN_SAMPLES} Samples, >={RULE_BASED_MIN_RATIO:.0%} konsistent)", str(rule_based_ready))
+        table5.add_row(f"Prior-bereit (>={LEARNING_PRIOR_MIN_SAMPLES} Samples)", str(prior_ready))
+        table5.add_row(f"Unzureichend (<{LEARNING_PRIOR_MIN_SAMPLES} Samples)", str(low_sample))
+        table5.add_row("LLM-Modell", LLM_MODEL or "(Server-Default)")
+        table5.add_row("Web-Hinweise", "aktiv" if ENABLE_WEB_HINTS else "inaktiv")
+        console.print(table5)
+    except Exception:
+        pass  # Learning file might not exist yet
+
+
+MONTH_NAMES_DE = [
+    "", "Januar", "Februar", "Maerz", "April", "Mai", "Juni",
+    "Juli", "August", "September", "Oktober", "November", "Dezember",
+]
+
+
+def show_monthly_report(run_db: LocalStateDB, paperless: PaperlessClient):
+    """Monatlichen Report aus SQLite-Daten anzeigen."""
+    now = datetime.now()
+    year_str = Prompt.ask("Jahr", default=str(now.year))
+    month_str = Prompt.ask("Monat (1-12)", default=str(now.month))
+    try:
+        year = int(year_str)
+        month = int(month_str)
+        if not 1 <= month <= 12:
+            raise ValueError
+    except ValueError:
+        console.print("[red]Ungueltige Eingabe.[/red]")
+        return
+
+    with console.status("Generiere Report..."):
+        report = run_db.generate_monthly_report(year, month)
+
+    month_label = MONTH_NAMES_DE[month] if 1 <= month <= 12 else str(month)
+    console.print(Panel(
+        f"[bold]Monatlicher Report: {month_label} {year}[/bold]",
+        border_style="blue",
+    ))
+
+    # Zusammenfassung
+    t1 = Table(title="Zusammenfassung", show_header=True, width=50)
+    t1.add_column("Metrik", style="cyan")
+    t1.add_column("Wert", justify="right", style="bold")
+    t1.add_row("Laeufe", str(report["total_runs"]))
+    t1.add_row("Dokumente verarbeitet", str(report["total_docs"]))
+    t1.add_row("Davon erfolgreich", str(report["success_docs"]))
+    t1.add_row("Erfolgsquote", f"{report['success_rate']:.1f} %")
+    for status, cnt in sorted(report["status_counts"].items()):
+        t1.add_row(f"  Status: {status}", str(cnt))
+    console.print(t1)
+
+    # Neue Korrespondenten
+    if report["new_correspondents"]:
+        t2 = Table(title="Neue Korrespondenten", show_header=True)
+        t2.add_column("Name", style="green")
+        for name in report["new_correspondents"]:
+            t2.add_row(name)
+        console.print(t2)
+    else:
+        console.print("[dim]Keine neuen Korrespondenten in diesem Zeitraum.[/dim]")
+
+    # Geloeschte Tags
+    if report["deleted_tags"]:
+        t3 = Table(title="Geloeschte Tags", show_header=True)
+        t3.add_column("Tag", style="red")
+        t3.add_column("Anzahl", justify="right")
+        for tag in report["deleted_tags"]:
+            t3.add_row(tag["name"], str(tag["count"]))
+        console.print(t3)
+    else:
+        console.print("[dim]Keine Tags geloescht in diesem Zeitraum.[/dim]")
+
+    # Offene Reviews
+    if report["open_reviews"]:
+        t4 = Table(title="Offene Reviews", show_header=True)
+        t4.add_column("ID", width=6)
+        t4.add_column("Dokument", width=10)
+        t4.add_column("Grund")
+        t4.add_column("Aktualisiert", width=20)
+        for item in report["open_reviews"]:
+            t4.add_row(str(item["id"]), str(item["doc_id"]), item["reason"], item["updated_at"])
+        console.print(t4)
+    else:
+        console.print("[dim]Keine offenen Reviews.[/dim]")
+
+    # Haeufigste Fehler
+    if report["errors"]:
+        t5 = Table(title="Haeufigste Fehler", show_header=True)
+        t5.add_column("Fehler", style="red", max_width=60)
+        t5.add_column("Anzahl", justify="right")
+        for err in report["errors"]:
+            t5.add_row(err["error"][:80], str(err["count"]))
+        console.print(t5)
+    else:
+        console.print("[dim]Keine Fehler in diesem Zeitraum.[/dim]")
+
+
+
+
+def _remove_review_tag_from_document(paperless: PaperlessClient, doc: dict):
+    """Entfernt den Manuell-Pruefen-Tag von einem Dokument, falls vorhanden."""
+    try:
+        all_tags = paperless.get_tags()
+    except Exception:
+        return
+    review_tag_id = None
+    for tag in all_tags:
+        if _normalize_tag_name(tag.get("name", "")) == _normalize_tag_name(REVIEW_TAG_NAME):
+            review_tag_id = tag["id"]
+            break
+    if review_tag_id is None:
+        return
+    current_tags = list(doc.get("tags") or [])
+    if review_tag_id not in current_tags:
+        return
+    current_tags.remove(review_tag_id)
+    try:
+        paperless.update_document(doc["id"], {"tags": current_tags})
+        log.info(f"  Review-Tag '{REVIEW_TAG_NAME}' entfernt von Dokument #{doc['id']}")
+    except Exception as exc:
+        log.warning(f"  Review-Tag-Entfernung fehlgeschlagen fuer #{doc['id']}: {exc}")
+
+
+def learn_from_review(review_id: int, run_db: LocalStateDB,
+                      paperless: PaperlessClient,
+                      learning_profile: LearningProfile | None,
+                      learning_examples: LearningExamples | None):
+    """Lernt aus einem manuell korrigierten Review-Eintrag und schliesst ihn."""
+    review = run_db.get_review_with_suggestion(review_id)
+    if not review:
+        log.warning(f"  Review #{review_id} nicht gefunden")
+        return False
+    doc_id = review["doc_id"]
+    try:
+        document = paperless.get_document(doc_id)
+    except Exception as exc:
+        log.warning(f"  Dokument #{doc_id} konnte nicht geladen werden: {exc}")
+        run_db.close_review(review_id)
+        return False
+
+    if not _is_fully_organized(document):
+        log.info(f"  Dokument #{doc_id} ist noch nicht vollstaendig organisiert - Review bleibt offen")
+        return False
+
+    # Aktuellen Stand als Suggestion bauen (IDs -> Namen aufloesen)
+    try:
+        all_correspondents = paperless.get_correspondents()
+        all_doc_types = paperless.get_document_types()
+        all_storage_paths = paperless.get_storage_paths()
+        all_tags = paperless.get_tags()
+    except Exception as exc:
+        log.warning(f"  Stammdaten konnten nicht geladen werden: {exc}")
+        run_db.close_review(review_id)
+        return False
+
+    corr_name = ""
+    if document.get("correspondent"):
+        for c in all_correspondents:
+            if c.get("id") == document["correspondent"]:
+                corr_name = c.get("name", "")
+                break
+    doctype_name = ""
+    if document.get("document_type"):
+        for dt in all_doc_types:
+            if dt.get("id") == document["document_type"]:
+                doctype_name = dt.get("name", "")
+                break
+    path_name = ""
+    if document.get("storage_path"):
+        for sp in all_storage_paths:
+            if sp.get("id") == document["storage_path"]:
+                path_name = sp.get("name", "")
+                break
+    tag_names = []
+    doc_tag_ids = set(document.get("tags") or [])
+    for tag in all_tags:
+        if tag.get("id") in doc_tag_ids:
+            tag_names.append(tag.get("name", ""))
+
+    current_suggestion = {
+        "correspondent": corr_name,
+        "document_type": doctype_name,
+        "storage_path": path_name,
+        "tags": tag_names,
+        "title": document.get("title", ""),
+    }
+
+    if learning_examples:
+        try:
+            learning_examples.append(document, current_suggestion)
+            log.info(f"  Learning-Beispiel gespeichert fuer Dokument #{doc_id}")
+        except Exception as exc:
+            log.warning(f"  Learning-Beispiel konnte nicht gespeichert werden: {exc}")
+
+    if learning_profile:
+        try:
+            learning_profile.learn_from_document(document, current_suggestion)
+            learning_profile.save()
+            log.info(f"  Learning-Profil aktualisiert fuer Dokument #{doc_id}")
+        except Exception as exc:
+            log.warning(f"  Learning-Profil konnte nicht aktualisiert werden: {exc}")
+
+    run_db.close_review(review_id)
+    _remove_review_tag_from_document(paperless, document)
+    log.info(f"  Review #{review_id} geschlossen + gelernt (Dokument #{doc_id})")
+    return True
+
+
+def auto_resolve_reviews(run_db: LocalStateDB, paperless: PaperlessClient,
+                         learning_profile: LearningProfile | None,
+                         learning_examples: LearningExamples | None,
+                         limit: int = 20) -> tuple[int, int]:
+    """Prueft offene Reviews und schliesst automatisch, wenn Dokumente inzwischen organisiert sind."""
+    open_reviews = run_db.list_open_reviews(limit=limit)
+    if not open_reviews:
+        return 0, 0
+
+    resolved = 0
+    checked = 0
+    for item in open_reviews:
+        checked += 1
+        review_id = item["id"]
+        try:
+            result = learn_from_review(review_id, run_db, paperless,
+                                       learning_profile, learning_examples)
+            if result:
+                resolved += 1
+        except Exception as exc:
+            log.warning(f"  Auto-Resolve Fehler bei Review #{review_id}: {exc}")
+
+    return resolved, checked
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -4450,6 +5354,7 @@ class App:
         refresh_cycles = max(1, AUTOPILOT_CONTEXT_REFRESH_CYCLES)
         cleanup_every = max(0, AUTOPILOT_CLEANUP_EVERY_CYCLES)
         dupscan_every = max(0, AUTOPILOT_DUPLICATE_SCAN_EVERY_CYCLES)
+        review_resolve_every = max(0, AUTOPILOT_REVIEW_RESOLVE_EVERY_CYCLES)
         max_new_per_cycle = max(0, AUTOPILOT_MAX_NEW_DOCS_PER_CYCLE)
 
         run_id = self._start_run("autopilot")
@@ -4462,6 +5367,7 @@ class App:
         total_doc_failures = 0
         total_maintenance_runs = 0
         total_duplicate_scans = 0
+        total_reviews_resolved = 0
         reconnect_attempts = 0
         consecutive_poll_errors = 0
         cycle = 0
@@ -4640,6 +5546,19 @@ class App:
                         total_poll_errors += 1
                         log.error(f"AUTOPILOT Duplikat-Scan-Fehler: {exc}")
 
+                if review_resolve_every > 0 and cycle % review_resolve_every == 0:
+                    try:
+                        log.info("AUTOPILOT: Review-Queue pruefen...")
+                        resolved, checked = auto_resolve_reviews(
+                            self.run_db, self.paperless,
+                            self.learning_profile, self.learning_examples)
+                        if resolved:
+                            log.info(f"AUTOPILOT: {resolved}/{checked} Reviews automatisch geschlossen")
+                        total_reviews_resolved += resolved
+                    except Exception as exc:
+                        total_poll_errors += 1
+                        log.error(f"AUTOPILOT Review-Resolve-Fehler: {exc}")
+
                 time.sleep(interval_sec)
         except KeyboardInterrupt:
             log.info("AUTOPILOT vom Benutzer gestoppt")
@@ -4656,6 +5575,7 @@ class App:
                 "skipped_fully_organized": total_skipped_fully_organized,
                 "maintenance_runs": total_maintenance_runs,
                 "duplicate_scans": total_duplicate_scans,
+                "reviews_resolved": total_reviews_resolved,
                 "poll_errors": total_poll_errors,
                 "reconnect_attempts": reconnect_attempts,
                 "interval_sec": interval_sec,
@@ -4765,10 +5685,35 @@ class App:
         find_duplicates(self.paperless)
 
     def action_statistics(self):
-        """Statistiken anzeigen."""
-        if not self._init_paperless():
-            return
-        show_statistics(self.paperless)
+        """Statistiken-Untermenue."""
+        while True:
+            choice = self._menu("Statistiken", [
+                ("1", "Paperless-Uebersicht"),
+                ("2", "Monatlicher Report"),
+                ("3", "Review-Queue auto-resolve"),
+                ("0", "Zurueck"),
+            ])
+            if choice == "1":
+                if not self._init_paperless():
+                    return
+                show_statistics(self.paperless)
+            elif choice == "2":
+                show_monthly_report(self.run_db, self.paperless)
+            elif choice == "3":
+                if not self._init_paperless():
+                    return
+                with console.status("Pruefe offene Reviews..."):
+                    resolved, checked = auto_resolve_reviews(
+                        self.run_db, self.paperless,
+                        self.learning_profile, self.learning_examples)
+                if checked == 0:
+                    console.print("[dim]Keine offenen Reviews vorhanden.[/dim]")
+                elif resolved > 0:
+                    console.print(f"[green]{resolved}/{checked} Reviews automatisch geschlossen + gelernt.[/green]")
+                else:
+                    console.print(f"[yellow]0/{checked} Reviews konnten automatisch geschlossen werden.[/yellow]")
+            elif choice == "0":
+                break
 
     def action_review_queue(self):
         """Offene menschliche Nachpruefungen anzeigen."""
@@ -4790,8 +5735,20 @@ class App:
             except ValueError:
                 console.print("[red]Ungueltige ID.[/red]")
                 return
-            if self.run_db.close_review(review_id):
-                console.print("[green]Review-Eintrag geschlossen.[/green]")
+            if not self._init_paperless():
+                if self.run_db.close_review(review_id):
+                    console.print("[green]Review-Eintrag geschlossen (ohne Lernen).[/green]")
+                else:
+                    console.print("[yellow]Kein offener Eintrag mit dieser ID gefunden.[/yellow]")
+                return
+            result = learn_from_review(
+                review_id, self.run_db, self.paperless,
+                self.learning_profile, self.learning_examples,
+            )
+            if result:
+                console.print("[green]Review-Eintrag geschlossen + gelernt.[/green]")
+            elif self.run_db.close_review(review_id):
+                console.print("[green]Review-Eintrag geschlossen (Dokument noch nicht fertig organisiert).[/green]")
             else:
                 console.print("[yellow]Kein offener Eintrag mit dieser ID gefunden.[/yellow]")
 
