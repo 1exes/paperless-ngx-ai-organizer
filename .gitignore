@@ -17,6 +17,7 @@ duplikate_bericht.txt
 # Learning data (user-specific, regenerated)
 learning_examples.jsonl
 learning_profile.json
+backups/
 
 # IDE
 .idea/
