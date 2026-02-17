@@ -9,7 +9,7 @@ Interaktive Rich Terminal-UI mit Menuesystem.
 
 from __future__ import annotations
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 import os
 import sys
@@ -23,6 +23,8 @@ import threading
 import difflib
 import unicodedata
 import signal
+import hashlib
+import random
 import requests
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -383,6 +385,55 @@ class LocalStateDB:
             "errors": error_list,
         }
 
+    def get_processing_stats(self, days: int = 30) -> dict:
+        """Aggregate processing statistics over the last N days."""
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        with self._lock, self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            # Status breakdown
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS cnt FROM documents WHERE created_at >= ? GROUP BY status",
+                (cutoff,),
+            ).fetchall()
+            status_counts = {r["status"]: r["cnt"] for r in rows}
+            total = sum(status_counts.values())
+            updated = sum(status_counts.get(s, 0) for s in ("updated", "ok", "applied"))
+            errors = sum(v for k, v in status_counts.items() if k.startswith("error"))
+            reviews = sum(status_counts.get(s, 0) for s in ("queued_review", "queued_review_update_error"))
+            rule_based = status_counts.get("rule_based", 0)
+            prior_fb = status_counts.get("prior_fallback", 0)
+            # Runs
+            run_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM runs WHERE started_at >= ?", (cutoff,),
+            ).fetchone()
+            total_runs = run_row["cnt"] if run_row else 0
+            # Open reviews
+            rev_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM review_queue WHERE status = 'open'",
+            ).fetchone()
+            open_reviews = rev_row["cnt"] if rev_row else 0
+            # Top errors
+            top_errors = conn.execute(
+                "SELECT error_text, COUNT(*) AS cnt FROM documents "
+                "WHERE created_at >= ? AND error_text IS NOT NULL AND error_text != '' "
+                "GROUP BY error_text ORDER BY cnt DESC LIMIT 5",
+                (cutoff,),
+            ).fetchall()
+            top_error_list = [{"error": r["error_text"][:80], "count": r["cnt"]} for r in top_errors]
+        return {
+            "days": days,
+            "total_docs": total,
+            "updated": updated,
+            "errors": errors,
+            "reviews": reviews,
+            "rule_based": rule_based,
+            "prior_fallback": prior_fb,
+            "success_rate": (updated / total * 100) if total > 0 else 0.0,
+            "total_runs": total_runs,
+            "open_reviews": open_reviews,
+            "top_errors": top_error_list,
+            "status_breakdown": dict(status_counts),
+        }
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -500,6 +551,10 @@ WATCH_ERROR_BACKOFF_MAX_SEC = int(os.getenv("WATCH_ERROR_BACKOFF_MAX_SEC", "180"
 SKIP_RECENT_LLM_ERRORS_MINUTES = int(os.getenv("SKIP_RECENT_LLM_ERRORS_MINUTES", "240"))
 SKIP_RECENT_LLM_ERRORS_THRESHOLD = int(os.getenv("SKIP_RECENT_LLM_ERRORS_THRESHOLD", "1"))
 
+# --- Quiet Hours (pause processing during these hours, 0=disabled) ---
+QUIET_HOURS_START = int(os.getenv("QUIET_HOURS_START", "0"))  # e.g. 23 for 23:00
+QUIET_HOURS_END = int(os.getenv("QUIET_HOURS_END", "0"))      # e.g. 6 for 06:00
+
 # --- Optional web hints for unknown brands/entities ---
 ENABLE_WEB_HINTS = os.getenv("ENABLE_WEB_HINTS", "0").strip().lower() in ("1", "true", "yes", "on")
 WEB_HINT_TIMEOUT = int(os.getenv("WEB_HINT_TIMEOUT", "6"))
@@ -590,6 +645,19 @@ TRANSPORT_TICKET_HINTS = [
     "fahrkarte", "deutschlandticket", "deutsche bahn", "bahn", "verkehrsverbund", "omnibus", "bus",
     "zugticket", "bahnticket",
 ]
+
+
+def _is_quiet_hours() -> bool:
+    """Check if current time is within configured quiet hours."""
+    if QUIET_HOURS_START == 0 and QUIET_HOURS_END == 0:
+        return False
+    hour = datetime.now().hour
+    if QUIET_HOURS_START < QUIET_HOURS_END:
+        # e.g. 2:00 - 6:00
+        return QUIET_HOURS_START <= hour < QUIET_HOURS_END
+    else:
+        # e.g. 23:00 - 6:00 (crosses midnight)
+        return hour >= QUIET_HOURS_START or hour < QUIET_HOURS_END
 
 
 def _validate_config():
@@ -935,7 +1003,7 @@ class LearningExamples:
         stop = {"und", "der", "die", "das", "von", "mit", "fuer", "for", "the", "and", "ein", "eine"}
         return {w for w in words if w not in stop}
 
-    def append(self, document: dict, suggestion: dict):
+    def append(self, document: dict, suggestion: dict, rejected: bool = False):
         row = {
             "ts": datetime.now().isoformat(timespec="seconds"),
             "doc_title": _normalize_text(str(document.get("title", ""))),
@@ -945,6 +1013,8 @@ class LearningExamples:
             "storage_path": _normalize_text(str(suggestion.get("storage_path", ""))),
             "tags": [_normalize_text(str(t)) for t in (suggestion.get("tags") or []) if _normalize_text(str(t))],
         }
+        if rejected:
+            row["rejected"] = True
         if not row["correspondent"] and not row["document_type"] and not row["storage_path"]:
             return
 
@@ -955,6 +1025,21 @@ class LearningExamples:
             with open(self.path, "w", encoding="utf-8") as f:
                 for entry in self._examples:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def get_rejected_patterns(self, correspondent: str, limit: int = 5) -> list[dict]:
+        """Get recent rejected suggestions for a correspondent to avoid repeating mistakes."""
+        corr_norm = _normalize_text(correspondent)
+        if not corr_norm:
+            return []
+        rejected = []
+        for entry in reversed(self._examples):
+            if not entry.get("rejected"):
+                continue
+            if _normalize_text(str(entry.get("correspondent", ""))) == corr_norm:
+                rejected.append(entry)
+                if len(rejected) >= limit:
+                    break
+        return rejected
 
     def select(self, document: dict, limit: int = LEARNING_EXAMPLE_LIMIT) -> list[dict]:
         if not self._examples:
@@ -970,6 +1055,8 @@ class LearningExamples:
 
         scored = []
         for entry in self._examples[-500:]:
+            if entry.get("rejected"):
+                continue  # Skip negative examples from few-shot selection
             text = " ".join([
                 str(entry.get("doc_title", "")),
                 str(entry.get("filename", "")),
@@ -1005,6 +1092,8 @@ class LearningExamples:
     def _build_correspondent_profiles(self) -> list[dict]:
         grouped: dict[str, dict] = {}
         for entry in self._examples:
+            if entry.get("rejected"):
+                continue  # Skip negative examples from profile building
             corr = _normalize_text(str(entry.get("correspondent", "")))
             if not corr:
                 continue
@@ -1256,7 +1345,8 @@ class PaperlessClient:
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as exc:
                 last_exc = exc
                 if attempt < MAX_RETRIES - 1:
-                    time.sleep(1.5 * (attempt + 1))
+                    backoff = min(30, (2 ** attempt) + random.uniform(0, 1))
+                    time.sleep(backoff)
                     continue
                 raise
             except requests.exceptions.RequestException:
@@ -1296,7 +1386,7 @@ class PaperlessClient:
         return "#000000" if luminance >= 170 else "#ffffff"
 
     def _write_with_retry(self, method: str, url: str, data: dict, timeout: int = 30) -> requests.Response:
-        """Schreiboperation mit Retry bei transienten Fehlern."""
+        """Schreiboperation mit Retry + exponential backoff bei transienten Fehlern."""
         self._rate_limit_write()
         last_exc = None
         for attempt in range(MAX_RETRIES):
@@ -1308,7 +1398,8 @@ class PaperlessClient:
                     requests.exceptions.ReadTimeout) as exc:
                 last_exc = exc
                 if attempt < MAX_RETRIES - 1:
-                    time.sleep(1.5 * (attempt + 1))
+                    backoff = min(30, (2 ** attempt) + random.uniform(0, 1))
+                    time.sleep(backoff)
                     continue
                 raise
             except requests.exceptions.RequestException:
@@ -1823,6 +1914,34 @@ def _assess_ocr_quality(document: dict) -> tuple[str, float]:
         return ("poor", score)
 
 
+def _extract_invoice_number(content: str) -> str:
+    """Extract invoice/reference number from content."""
+    patterns = [
+        r"(?:Rechnungsnr|Rechnungsnummer|Rechnung\s*Nr|Invoice\s*No|Invoice\s*#|Belegnr|Beleg-Nr|Vorgangsnr)\.?\s*[:\s]?\s*([A-Z0-9][\w\-/]{3,20})",
+        r"(?:Kundennr|Kunden-Nr|Vertragsnr|Vertrags-Nr|Aktenzeichen|Az)\.?\s*[:\s]?\s*([A-Z0-9][\w\-/]{3,20})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, content[:2000], re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _extract_amount(content: str) -> str:
+    """Extract a monetary amount from content (German format)."""
+    # Match German currency formats: 1.234,56 EUR or 1234,56 € or EUR 1.234,56
+    patterns = [
+        r"(?:Gesamtbetrag|Rechnungsbetrag|Summe|Total|Betrag|Endbetrag)\s*[:\s]?\s*(\d{1,3}(?:\.\d{3})*,\d{2})\s*(?:EUR|€)?",
+        r"(?:EUR|€)\s*(\d{1,3}(?:\.\d{3})*,\d{2})",
+        r"(\d{1,3}(?:\.\d{3})*,\d{2})\s*(?:EUR|€)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, content[:3000], re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
 def _improve_title(title: str, document: dict) -> str:
     """Clean up and improve LLM-generated titles."""
     if not title:
@@ -1849,6 +1968,22 @@ def _improve_title(title: str, document: dict) -> str:
     # Capitalize first letter
     if title and title[0].islower():
         title = title[0].upper() + title[1:]
+
+    # Enrich short/generic titles with extracted details
+    content = document.get("content") or ""
+    title_lower = title.lower()
+    if content and len(title) < 60:
+        # Add invoice number if title is a generic type name
+        if any(kw in title_lower for kw in ("rechnung", "invoice", "beleg", "quittung")):
+            inv_nr = _extract_invoice_number(content)
+            if inv_nr and inv_nr.lower() not in title_lower:
+                title = f"{title} Nr. {inv_nr}"
+        # Add amount for financial documents
+        if any(kw in title_lower for kw in ("rechnung", "mahnung", "gutschrift", "kontoauszug")):
+            amount = _extract_amount(content)
+            if amount and amount not in title:
+                title = f"{title} ({amount} EUR)"
+
     # Truncate very long titles
     if len(title) > 128:
         title = title[:125] + "..."
@@ -1880,6 +2015,52 @@ def _content_similarity(fp_a: set[int], fp_b: set[int]) -> float:
     intersection = len(fp_a & fp_b)
     union = len(fp_a | fp_b)
     return intersection / max(1, union)
+
+
+def _minhash_signature(trigram_set: set[int], num_hashes: int = 128) -> tuple[int, ...]:
+    """Compute a MinHash signature for LSH-based near-duplicate detection.
+
+    Uses num_hashes different hash functions (simulated via XOR with random seeds)
+    to create a compact signature. Two documents with high Jaccard similarity
+    will have similar signatures.
+    """
+    if not trigram_set:
+        return ()
+    # Deterministic seeds for reproducibility
+    seeds = tuple(range(1, num_hashes + 1))
+    sig = []
+    for seed in seeds:
+        min_val = min((h ^ (seed * 0x9E3779B9)) & 0xFFFFFFFF for h in trigram_set)
+        sig.append(min_val)
+    return tuple(sig)
+
+
+def _lsh_find_candidates(signatures: list[tuple[int, ...]], num_bands: int = 16) -> list[tuple[int, int]]:
+    """Locality Sensitive Hashing: find candidate pairs with high similarity.
+
+    Divides each signature into bands and hashes each band. Documents that
+    share at least one band hash are candidate near-duplicates.
+    This reduces O(n^2) comparisons to roughly O(n) for large collections.
+    """
+    if not signatures:
+        return []
+    sig_len = len(signatures[0])
+    rows_per_band = max(1, sig_len // num_bands)
+    candidates: set[tuple[int, int]] = set()
+
+    for band_idx in range(num_bands):
+        start = band_idx * rows_per_band
+        end = min(start + rows_per_band, sig_len)
+        buckets: dict[int, list[int]] = defaultdict(list)
+        for doc_idx, sig in enumerate(signatures):
+            band_hash = hash(sig[start:end])
+            buckets[band_hash].append(doc_idx)
+        for bucket in buckets.values():
+            if len(bucket) > 1 and len(bucket) <= 50:  # Skip very large buckets (noise)
+                for i in range(len(bucket)):
+                    for j in range(i + 1, len(bucket)):
+                        candidates.add((bucket[i], bucket[j]))
+    return sorted(candidates)
 
 
 _KNOWN_BLZ = {
@@ -2499,6 +2680,38 @@ def _build_suggestion_from_priors(document: dict, learning_hints: list[dict],
     return suggestion
 
 
+def _detect_content_hints(document: dict) -> list[str]:
+    """Detect content patterns and suggest additional tags/document type hints."""
+    hints = []
+    content = (document.get("content") or "")[:3000].lower()
+    if not content:
+        return hints
+
+    # IBAN present -> financial document
+    if re.search(r"[a-z]{2}\d{2}\s?\d{4}\s?\d{4}\s?\d{4}\s?\d{4}\s?\d{0,4}", content):
+        hints.append("iban_present")
+    # Invoice patterns
+    if re.search(r"(rechnungsnr|rechnungsnummer|invoice\s*no|faktura)", content):
+        hints.append("invoice_detected")
+    # Contract patterns
+    if re.search(r"(vertragsnummer|vertragslaufzeit|kuendigungsfrist|laufzeit)", content):
+        hints.append("contract_detected")
+    # Tax document patterns
+    if re.search(r"(steuernummer|finanzamt|einkommensteuerbescheid|steuererkl)", content):
+        hints.append("tax_detected")
+    # Insurance patterns
+    if re.search(r"(versicherungsnummer|policen?nummer|versicherungsschein|schadensnummer)", content):
+        hints.append("insurance_detected")
+    # Salary/payroll
+    if re.search(r"(bruttobezug|nettobetrag|lohnsteuer|sozialversicherung|gehaltsabrechnung)", content):
+        hints.append("salary_detected")
+    # Medical
+    if re.search(r"(diagnose|befund|therapie|patient|krankenkasse|heilbehandlung)", content):
+        hints.append("medical_detected")
+
+    return hints
+
+
 def _select_controlled_tags(suggested_tags: list, existing_tags: list, taxonomy: TagTaxonomy | None = None,
                             run_db: LocalStateDB | None = None, run_id: int | None = None,
                             doc_id: int | None = None) -> tuple[list, list]:
@@ -2759,6 +2972,22 @@ class LocalLLMAnalyzer:
     def __init__(self, url: str = LLM_URL, model: str = LLM_MODEL):
         self.url = self._normalize_url(url)
         self.model = (model or "").strip()
+        self._response_times: list[float] = []  # Track last N response times for adaptive timeout
+        self._max_tracked = 50
+
+    @property
+    def avg_response_time(self) -> float:
+        """Average LLM response time in seconds (0.0 if no data)."""
+        return sum(self._response_times) / len(self._response_times) if self._response_times else 0.0
+
+    @property
+    def p95_response_time(self) -> float:
+        """95th percentile response time in seconds."""
+        if not self._response_times:
+            return 0.0
+        sorted_times = sorted(self._response_times)
+        idx = int(len(sorted_times) * 0.95)
+        return sorted_times[min(idx, len(sorted_times) - 1)]
 
     @staticmethod
     def _normalize_url(url: str) -> str:
@@ -3110,12 +3339,30 @@ NUR JSON, kein anderer Text:
             else (LLM_COMPACT_TIMEOUT if compact_mode else LLM_TIMEOUT)
         )
 
+        # Build enum constraints for Ollama structured JSON output
+        # This prevents hallucination at the token level for categorical fields
+        schema_enums: dict | None = None
+        if self._use_ollama_chat_api():
+            enums: dict = {}
+            if corr_names:
+                # Include empty string to allow "no correspondent" (model can still suggest new ones in text)
+                enums["correspondent"] = corr_names + [""]
+            if path_names:
+                enums["storage_path"] = path_names
+            if ALLOWED_DOC_TYPES:
+                enums["document_type"] = list(ALLOWED_DOC_TYPES)
+            if tag_choices:
+                enums["tags"] = tag_choices
+            if enums:
+                schema_enums = enums
+
         # LLM-Anfrage
         response = self._call_llm(
             prompt,
             read_timeout=effective_read_timeout,
             retries=1 if compact_mode else LLM_RETRY_COUNT,
             max_tokens=LLM_COMPACT_MAX_TOKENS if compact_mode else LLM_MAX_TOKENS,
+            schema_enums=schema_enums,
         )
 
         # JSON parsen - bei Fehler Retry mit Reasoning-Prompt
@@ -3139,6 +3386,7 @@ NUR JSON, kein anderer Text:
                 read_timeout=effective_read_timeout,
                 retries=1,
                 max_tokens=LLM_COMPACT_MAX_TOKENS if compact_mode else LLM_MAX_TOKENS,
+                schema_enums=schema_enums,
             )
             suggestion = self._parse_json_response(response)
 
@@ -3199,13 +3447,28 @@ Antworte NUR mit korrigiertem JSON (oder identischem wenn alles stimmt):
     def _use_ollama_chat_api(self) -> bool:
         return self.url.rstrip("/").endswith("/api/chat")
 
-    def _build_payload(self, prompt: str, max_tokens: int | None = None) -> dict:
+    def _build_payload(self, prompt: str, max_tokens: int | None = None,
+                       schema_enums: dict | None = None) -> dict:
         token_limit = max(64, int(max_tokens if max_tokens is not None else LLM_MAX_TOKENS))
         if self._use_ollama_chat_api():
             messages = []
             if LLM_SYSTEM_PROMPT:
                 messages.append({"role": "system", "content": LLM_SYSTEM_PROMPT})
             messages.append({"role": "user", "content": prompt})
+            # Build JSON schema with optional enum constraints for Ollama structured output
+            corr_prop: dict = {"type": "string"}
+            dtype_prop: dict = {"type": "string"}
+            spath_prop: dict = {"type": "string"}
+            tag_items: dict = {"type": "string"}
+            if schema_enums:
+                if schema_enums.get("correspondent"):
+                    corr_prop = {"type": "string", "enum": schema_enums["correspondent"]}
+                if schema_enums.get("document_type"):
+                    dtype_prop = {"type": "string", "enum": schema_enums["document_type"]}
+                if schema_enums.get("storage_path"):
+                    spath_prop = {"type": "string", "enum": schema_enums["storage_path"]}
+                if schema_enums.get("tags"):
+                    tag_items = {"type": "string", "enum": schema_enums["tags"]}
             payload = {
                 "messages": messages,
                 "stream": False,
@@ -3217,11 +3480,11 @@ Antworte NUR mit korrigiertem JSON (oder identischem wenn alles stimmt):
                     "type": "object",
                     "properties": {
                         "title": {"type": "string"},
-                        "tags": {"type": "array", "items": {"type": "string"}},
-                        "correspondent": {"type": "string"},
-                        "document_type": {"type": "string"},
+                        "tags": {"type": "array", "items": tag_items},
+                        "correspondent": corr_prop,
+                        "document_type": dtype_prop,
                         "storage_path_name": {"type": "string"},
-                        "storage_path": {"type": "string"},
+                        "storage_path": spath_prop,
                         "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
                         "reasoning": {"type": "string"},
                     },
@@ -3320,7 +3583,8 @@ Antworte NUR mit korrigiertem JSON (oder identischem wenn alles stimmt):
                 transient_400 = resp.status_code == 400 and not (resp.text or "").strip()
                 if resp.status_code in (429, 500, 502, 503, 504) or transient_400:
                     if attempt < max_attempts - 1:
-                        time.sleep(0.8 + attempt * 0.8)
+                        backoff = min(30, (2 ** attempt) * 0.8 + random.uniform(0, 0.5))
+                        time.sleep(backoff)
                         continue
                     continue
                 return resp
@@ -3330,7 +3594,8 @@ Antworte NUR mit korrigiertem JSON (oder identischem wenn alles stimmt):
             except requests.exceptions.RequestException as exc:
                 last_exc = exc
                 if attempt < max_attempts - 1:
-                    time.sleep(0.8 + attempt * 0.8)
+                    backoff = min(30, (2 ** attempt) * 0.8 + random.uniform(0, 0.5))
+                    time.sleep(backoff)
                     continue
         if last_exc is not None:
             raise last_exc
@@ -3342,17 +3607,24 @@ Antworte NUR mit korrigiertem JSON (oder identischem wenn alles stimmt):
         read_timeout: int | None = None,
         retries: int | None = None,
         max_tokens: int | None = None,
+        schema_enums: dict | None = None,
     ) -> str:
         """Sendet Prompt an LLM-Endpunkt und gibt Antwort zurueck."""
         headers = self._auth_headers()
-        payload = self._build_payload(prompt, max_tokens=max_tokens)
+        payload = self._build_payload(prompt, max_tokens=max_tokens, schema_enums=schema_enums)
+        t0 = time.perf_counter()
         resp = self._post_with_retry(headers, payload, read_timeout=read_timeout, retries=retries)
+        elapsed = time.perf_counter() - t0
+        if resp.ok:
+            self._response_times.append(elapsed)
+            if len(self._response_times) > self._max_tracked:
+                self._response_times = self._response_times[-self._max_tracked:]
 
         # Retry 1: if model handling might be the issue, use server-default once.
         if resp.status_code in (400, 422) and self.model:
             model_backup = self.model
             self.model = ""
-            retry_payload = self._build_payload(prompt, max_tokens=max_tokens)
+            retry_payload = self._build_payload(prompt, max_tokens=max_tokens, schema_enums=schema_enums)
             retry_resp = self._post_with_retry(headers, retry_payload, read_timeout=read_timeout, retries=1)
             if retry_resp.ok:
                 resp = retry_resp
@@ -3364,7 +3636,7 @@ Antworte NUR mit korrigiertem JSON (oder identischem wenn alles stimmt):
             detected_model = self._discover_model(headers)
             if detected_model:
                 self.model = detected_model
-                retry_payload = self._build_payload(prompt, max_tokens=max_tokens)
+                retry_payload = self._build_payload(prompt, max_tokens=max_tokens, schema_enums=schema_enums)
                 retry_resp = self._post_with_retry(headers, retry_payload, read_timeout=read_timeout, retries=1)
                 if retry_resp.ok:
                     resp = retry_resp
@@ -3656,6 +3928,11 @@ def process_document(doc_id: int, paperless: PaperlessClient,
     doc_lang = _detect_language(document.get("content") or "")
     if doc_lang == "en":
         log.info("  Sprache: Englisch erkannt")
+
+    # Content pattern hints
+    content_hints = _detect_content_hints(document)
+    if content_hints:
+        log.info(f"  Inhaltsmuster erkannt: {', '.join(content_hints)}")
 
     few_shot_examples = learning_examples.select(document, limit=LEARNING_EXAMPLE_LIMIT) if learning_examples else []
     learning_hints = (
@@ -4028,6 +4305,11 @@ def auto_organize_all(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
     total = len(documents)
     log.info(f"  {total} Dokumente geladen")
 
+    # Sanity check: warn if document count seems wrong
+    if total == 0:
+        log.warning("[yellow]Keine Dokumente gefunden - API-Verbindung pruefen![/yellow]")
+        return {"total": 0, "todo": 0, "applied": 0, "errors": 0}
+
     # Duplikate rausfiltern
     duplikat_tag_id = next((t["id"] for t in tags if t["name"] == "Duplikat"), None)
     if duplikat_tag_id:
@@ -4068,10 +4350,13 @@ def auto_organize_all(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
             )
         todo = filtered_todo
 
+    # Sort: newest documents first (users care most about recent uploads)
+    todo.sort(key=lambda d: d.get("added", d.get("created", "")), reverse=True)
+
     if not todo:
         if skipped_recent_total:
             log.warning(
-                f"[yellow]Nichts verarbeitet: {skipped_recent_total} Dokumente sind temporÃ¤r im LLM-Fehler-Backoff.[/yellow]"
+                f"[yellow]Nichts verarbeitet: {skipped_recent_total} Dokumente sind temporaer im LLM-Fehler-Backoff.[/yellow]"
             )
             return {"total": total, "todo": 0, "applied": 0, "errors": 0, "skipped_recent_errors": skipped_recent_total}
         log.info("[bold green]Alles sortiert! Nichts zu tun.[/bold green]")
@@ -4716,6 +5001,15 @@ def find_duplicates(paperless: PaperlessClient):
         if not all(d["id"] in exact_ids for d in v)
     }
 
+    # Nach Inhalts-Checksum gruppieren (exakte Inhalts-Duplikate)
+    by_checksum = defaultdict(list)
+    for d in docs:
+        content = (d.get("content") or "").strip()
+        if content and len(content) > 50:
+            chk = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
+            by_checksum[chk].append(d)
+    checksum_dupes = {k: v for k, v in by_checksum.items() if len(v) > 1}
+
     # Nach Titel gruppieren (case-insensitive)
     by_title = defaultdict(list)
     for d in docs:
@@ -4723,6 +5017,26 @@ def find_duplicates(paperless: PaperlessClient):
         if title and title != "unbekannt":
             by_title[title].append(d)
     title_dupes = {k: v for k, v in by_title.items() if len(v) > 1}
+
+    # Inhalts-Checksum-Duplikate anzeigen (exakt gleicher Inhalt)
+    if checksum_dupes:
+        console.print(f"\n[bold red]Exakt gleicher Inhalt (Checksum): {len(checksum_dupes)} Gruppen[/bold red]")
+        for chk, items in sorted(checksum_dupes.items(), key=lambda x: -len(x[1])):
+            table = Table(title=f"SHA256-Prefix: {chk}", show_header=True)
+            table.add_column("ID", width=6)
+            table.add_column("Dateiname")
+            table.add_column("Titel")
+            table.add_column("Erstellt", width=12)
+            for d in sorted(items, key=lambda x: x.get("id", 0)):
+                table.add_row(
+                    str(d["id"]),
+                    d.get("original_file_name", "?"),
+                    d.get("title", "?"),
+                    str(d.get("created", "?"))[:10],
+                )
+            console.print(table)
+    else:
+        console.print("\n[green]Keine exakten Inhalts-Duplikate gefunden.[/green]")
 
     # Dateiname-Duplikate anzeigen
     if filename_dupes:
@@ -4788,7 +5102,7 @@ def find_duplicates(paperless: PaperlessClient):
     else:
         console.print("\n[green]Keine Titel-Duplikate gefunden.[/green]")
 
-    # Content-Fingerprint: near-duplicate detection
+    # Content-Fingerprint: near-duplicate detection (with MinHash/LSH for scaling)
     console.print("\n[bold]Inhalts-Aehnlichkeit (Fingerprint-Analyse)...[/bold]")
     content_dupes = []
     fingerprints = []
@@ -4796,45 +5110,62 @@ def find_duplicates(paperless: PaperlessClient):
         fp = _content_fingerprint(str(d.get("content") or "")[:3000])
         if fp:
             fingerprints.append((d, fp))
-    # Compare all pairs (for small collections; skip if too many docs)
+
     if len(fingerprints) <= 2000:
+        # Small collection: brute-force pairwise comparison
         for i in range(len(fingerprints)):
             for j in range(i + 1, len(fingerprints)):
                 sim = _content_similarity(fingerprints[i][1], fingerprints[j][1])
                 if sim >= 0.75:
                     doc_a, doc_b = fingerprints[i][0], fingerprints[j][0]
                     content_dupes.append((sim, doc_a, doc_b))
-        content_dupes.sort(key=lambda x: x[0], reverse=True)
-        if content_dupes:
-            console.print(f"\n[bold]Inhalts-Aehnlichkeit: {len(content_dupes)} Paare (>=75%)[/bold]")
-            for sim, doc_a, doc_b in content_dupes[:20]:
-                console.print(
-                    f"  [yellow]{sim:.0%}[/yellow] aehnlich: "
-                    f"#{doc_a['id']} '{doc_a.get('title', '?')[:40]}' <-> "
-                    f"#{doc_b['id']} '{doc_b.get('title', '?')[:40]}'"
-                )
-            if len(content_dupes) > 20:
-                console.print(f"  ... und {len(content_dupes) - 20} weitere Paare")
-        else:
-            console.print("[green]Keine inhaltsaehnlichen Dokumente gefunden.[/green]")
+    elif len(fingerprints) <= 20000:
+        # Large collection: use MinHash + LSH for efficient candidate generation
+        console.print(f"  [cyan]MinHash/LSH-Modus fuer {len(fingerprints)} Dokumente...[/cyan]")
+        sigs = [_minhash_signature(fp) for _, fp in fingerprints]
+        candidates = _lsh_find_candidates(sigs)
+        console.print(f"  {len(candidates)} Kandidatenpaare gefunden, verifiziere...")
+        for i, j in candidates:
+            sim = _content_similarity(fingerprints[i][1], fingerprints[j][1])
+            if sim >= 0.75:
+                doc_a, doc_b = fingerprints[i][0], fingerprints[j][0]
+                content_dupes.append((sim, doc_a, doc_b))
     else:
-        console.print(f"  [yellow]Zu viele Dokumente ({len(fingerprints)}) fuer Fingerprint-Vergleich - uebersprungen[/yellow]")
-        content_dupes = []
+        console.print(f"  [yellow]Zu viele Dokumente ({len(fingerprints)}) - uebersprungen[/yellow]")
+
+    content_dupes.sort(key=lambda x: x[0], reverse=True)
+    if content_dupes:
+        console.print(f"\n[bold]Inhalts-Aehnlichkeit: {len(content_dupes)} Paare (>=75%)[/bold]")
+        for sim, doc_a, doc_b in content_dupes[:20]:
+            console.print(
+                f"  [yellow]{sim:.0%}[/yellow] aehnlich: "
+                f"#{doc_a['id']} '{doc_a.get('title', '?')[:40]}' <-> "
+                f"#{doc_b['id']} '{doc_b.get('title', '?')[:40]}'"
+            )
+        if len(content_dupes) > 20:
+            console.print(f"  ... und {len(content_dupes) - 20} weitere Paare")
+    else:
+        console.print("[green]Keine inhaltsaehnlichen Dokumente gefunden.[/green]")
 
     # Zusammenfassung
     console.print(f"\n[bold]Zusammenfassung:[/bold]")
+    console.print(f"  Exakte Inhalts-Duplikate: {len(checksum_dupes)} Gruppen ({sum(len(v) for v in checksum_dupes.values())} Dokumente)")
     console.print(f"  Dateiname-Duplikate: {len(filename_dupes)} Gruppen ({sum(len(v) for v in filename_dupes.values())} Dokumente)")
     console.print(f"  Titel-Duplikate: {len(title_dupes)} Gruppen ({sum(len(v) for v in title_dupes.values())} Dokumente)")
     console.print(f"  Inhalts-Aehnlichkeit: {len(content_dupes)} Paare")
     console.print("[red]Es wurden KEINE Dokumente geloescht![/red]")
-    log.info(f"  DUPLIKAT-SCAN fertig - {len(filename_dupes)} Dateiname-Gruppen, {len(title_dupes)} Titel-Gruppen, {len(content_dupes)} Inhalts-Paare")
+    log.info(
+        f"  DUPLIKAT-SCAN fertig - {len(checksum_dupes)} Checksum-Gruppen, "
+        f"{len(filename_dupes)} Dateiname-Gruppen, {len(title_dupes)} Titel-Gruppen, "
+        f"{len(content_dupes)} Inhalts-Paare"
+    )
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Statistiken
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
-def show_statistics(paperless: PaperlessClient):
+def show_statistics(paperless: PaperlessClient, run_db: LocalStateDB | None = None):
     """Uebersicht ueber Paperless-NGX Instanz."""
     console.print(Panel("[bold]Statistiken / Uebersicht[/bold]", border_style="blue"))
     log.info("[bold]STATISTIKEN[/bold] laden...")
@@ -4882,7 +5213,15 @@ def show_statistics(paperless: PaperlessClient):
     table2.add_row("Ohne Speicherpfad", str(no_path))
     table2.add_row("Nicht vollstaendig", str(incomplete))
     table2.add_row("Vollstaendig sortiert", f"[green]{fully_organized}[/green]")
+    # Stale documents: added >30 days ago but still not organized
+    stale_cutoff = (datetime.now() - timedelta(days=30)).isoformat()
+    stale_docs = [d for d in documents
+                  if not _is_fully_organized(d)
+                  and (d.get("added") or d.get("created", "9999")) < stale_cutoff]
+    stale_count = len(stale_docs)
+
     table2.add_row("Waisen (komplett leer)", f"[red]{orphans}[/red]" if orphans else "0")
+    table2.add_row("Stale (>30 Tage unorganisiert)", f"[red]{stale_count}[/red]" if stale_count else "0")
     table2.add_row("Organisationsgrad", f"{completeness:.1f}%")
     console.print(table2)
 
@@ -4906,6 +5245,46 @@ def show_statistics(paperless: PaperlessClient):
             table4.add_row(c["name"], str(c.get("document_count", 0)))
         console.print(table4)
 
+    # Correspondent activity: recent vs dormant
+    if correspondents and documents:
+        corr_last_activity: dict[int, str] = {}
+        for doc in documents:
+            cid = doc.get("correspondent")
+            if cid:
+                doc_date = doc.get("added") or doc.get("created") or ""
+                if doc_date > corr_last_activity.get(cid, ""):
+                    corr_last_activity[cid] = doc_date
+        recent_30 = (datetime.now() - timedelta(days=30)).isoformat()
+        recent_90 = (datetime.now() - timedelta(days=90)).isoformat()
+        active_30 = sum(1 for cid, dt in corr_last_activity.items() if dt >= recent_30)
+        active_90 = sum(1 for cid, dt in corr_last_activity.items() if dt >= recent_90)
+        dormant = sum(1 for c in correspondents if c["id"] not in corr_last_activity)
+        console.print(
+            f"\n[bold]Korrespondenten-Aktivitaet:[/bold] "
+            f"[green]{active_30}[/green] aktiv (30 Tage) | "
+            f"[yellow]{active_90}[/yellow] aktiv (90 Tage) | "
+            f"[dim]{dormant} ohne Dokumente[/dim]"
+        )
+
+    # Dokumenttyp-Verteilung
+    if doc_types:
+        dtype_sorted = sorted(doc_types, key=lambda x: x.get("document_count", 0), reverse=True)
+        used_types = [dt for dt in dtype_sorted if dt.get("document_count", 0) > 0]
+        if used_types:
+            table_dt = Table(title="Dokumenttyp-Verteilung", show_header=True)
+            table_dt.add_column("Typ", style="green")
+            table_dt.add_column("Dokumente", justify="right")
+            table_dt.add_column("Anteil", justify="right")
+            total_typed = sum(dt.get("document_count", 0) for dt in used_types)
+            for dt in used_types:
+                count = dt.get("document_count", 0)
+                pct = (count / total_typed * 100) if total_typed else 0
+                table_dt.add_row(dt["name"], str(count), f"{pct:.1f}%")
+            unused_types = len(dtype_sorted) - len(used_types)
+            if unused_types:
+                table_dt.add_row(f"[dim]({unused_types} ungenutzte Typen)[/dim]", "", "")
+            console.print(table_dt)
+
     # Speicherpfad-Verteilung
     if storage_paths:
         path_counts = sorted(storage_paths, key=lambda x: x.get("document_count", 0), reverse=True)
@@ -4923,6 +5302,27 @@ def show_statistics(paperless: PaperlessClient):
         if empty_paths:
             table_paths.add_row(f"[dim]({len(empty_paths)} leere Pfade)[/dim]", "", "")
         console.print(table_paths)
+
+    # Tag co-occurrence analysis
+    if tags and documents:
+        tag_name_map = {t["id"]: t["name"] for t in tags}
+        cooccur = defaultdict(int)
+        for doc in documents:
+            doc_tag_ids = doc.get("tags") or []
+            doc_tag_names = sorted(tag_name_map.get(tid, "") for tid in doc_tag_ids if tid in tag_name_map)
+            for i in range(len(doc_tag_names)):
+                for j in range(i + 1, len(doc_tag_names)):
+                    if doc_tag_names[i] and doc_tag_names[j]:
+                        cooccur[(doc_tag_names[i], doc_tag_names[j])] += 1
+        if cooccur:
+            top_pairs = sorted(cooccur.items(), key=lambda x: x[1], reverse=True)[:10]
+            co_table = Table(title="Tag-Kombinationen (Top 10)", show_header=True)
+            co_table.add_column("Tag A", style="green")
+            co_table.add_column("Tag B", style="green")
+            co_table.add_column("Gemeinsam", justify="right")
+            for (a, b), cnt in top_pairs:
+                co_table.add_row(a, b, str(cnt))
+            console.print(co_table)
 
     # Learning-System Statistiken
     try:
@@ -4949,6 +5349,33 @@ def show_statistics(paperless: PaperlessClient):
         console.print(table5)
     except Exception:
         pass  # Learning file might not exist yet
+
+    # Processing statistics from state DB
+    if run_db:
+        try:
+            stats = run_db.get_processing_stats(days=30)
+            table6 = Table(title="Verarbeitungsstatistik (letzte 30 Tage)", show_header=True, width=60)
+            table6.add_column("Metrik", style="cyan")
+            table6.add_column("Wert", justify="right", style="bold")
+            table6.add_row("Verarbeitete Dokumente", str(stats["total_docs"]))
+            table6.add_row("Erfolgreich aktualisiert", f"[green]{stats['updated']}[/green]")
+            table6.add_row("Fehler", f"[red]{stats['errors']}[/red]" if stats["errors"] else "0")
+            table6.add_row("Zur Review", str(stats["reviews"]))
+            table6.add_row("Regelbasiert (ohne LLM)", str(stats["rule_based"]))
+            table6.add_row("Prior-Fallback", str(stats["prior_fallback"]))
+            table6.add_row("Erfolgsrate", f"{stats['success_rate']:.1f}%")
+            table6.add_row("Laeufe", str(stats["total_runs"]))
+            table6.add_row("Offene Reviews", str(stats["open_reviews"]))
+            console.print(table6)
+            if stats["top_errors"]:
+                err_table = Table(title="Haeufigste Fehler", show_header=True)
+                err_table.add_column("Fehler", style="red")
+                err_table.add_column("Anzahl", justify="right")
+                for err in stats["top_errors"]:
+                    err_table.add_row(err["error"], str(err["count"]))
+                console.print(err_table)
+        except Exception:
+            pass
 
 
 MONTH_NAMES_DE = [
@@ -5130,10 +5557,35 @@ def learn_from_review(review_id: int, run_db: LocalStateDB,
 
     if learning_examples:
         try:
+            # Positive learning: record corrected state as good example
             learning_examples.append(document, current_suggestion)
             log.info(f"  Learning-Beispiel gespeichert fuer Dokument #{doc_id}")
         except Exception as exc:
             log.warning(f"  Learning-Beispiel konnte nicht gespeichert werden: {exc}")
+
+        # Negative learning: if original suggestion differed, record it as rejected
+        try:
+            orig_suggestion = review.get("suggestion")
+            if isinstance(orig_suggestion, str):
+                try:
+                    orig_suggestion = json.loads(orig_suggestion)
+                except (json.JSONDecodeError, TypeError):
+                    orig_suggestion = None
+            if orig_suggestion and isinstance(orig_suggestion, dict):
+                orig_corr = _normalize_text(str(orig_suggestion.get("correspondent", "")))
+                curr_corr = _normalize_text(corr_name)
+                orig_type = _normalize_text(str(orig_suggestion.get("document_type", "")))
+                curr_type = _normalize_text(doctype_name)
+                orig_path = _normalize_text(str(orig_suggestion.get("storage_path", "")))
+                curr_path = _normalize_text(path_name)
+                # Record as negative if correspondent OR doctype OR path was corrected
+                if (orig_corr and orig_corr != curr_corr) or \
+                   (orig_type and orig_type != curr_type) or \
+                   (orig_path and orig_path != curr_path):
+                    learning_examples.append(document, orig_suggestion, rejected=True)
+                    log.info(f"  Negative Learning: Originaler Vorschlag als Anti-Pattern gespeichert")
+        except Exception:
+            pass  # Negative learning is best-effort
 
     if learning_profile:
         try:
@@ -5806,6 +6258,12 @@ class App:
 
             while True:
                 cycle += 1
+                # Quiet hours: pause processing to reduce server load
+                if _is_quiet_hours():
+                    if cycle == 1 or cycle % 20 == 0:
+                        log.info(f"AUTOPILOT: Ruhestunden aktiv ({QUIET_HOURS_START}:00-{QUIET_HOURS_END}:00), pausiert...")
+                    time.sleep(60)
+                    continue
                 try:
                     docs = self.paperless.get_documents()
                 except Exception as exc:
@@ -6020,6 +6478,7 @@ class App:
             ("10", f"Menue 1: alle Dokumente neu pruefen (aktuell: {'JA' if RECHECK_ALL_DOCS_IN_AUTO else 'NEIN'})"),
             ("11", "Learning-Daten sichern (Backup)"),
             ("12", "Datenbank bereinigen (alte Runs loeschen)"),
+            ("13", "Verarbeitungshistorie exportieren (CSV)"),
             ("0", "Zurueck"),
         ])
 
@@ -6105,6 +6564,34 @@ class App:
             else:
                 console.print("[dim]Keine alten Eintraege gefunden.[/dim]")
 
+        elif choice == "13":
+            import csv as csv_mod
+            export_path = os.path.join(LOG_DIR, f"processing_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+            try:
+                with self.run_db._lock, self.run_db._connect() as conn:
+                    conn.row_factory = sqlite3.Row
+                    rows = conn.execute(
+                        "SELECT d.doc_id, d.status, d.title_before, d.title_after, "
+                        "d.correspondent_before, d.correspondent_after, d.error_text, d.created_at, "
+                        "r.action, r.llm_model "
+                        "FROM documents d LEFT JOIN runs r ON d.run_id = r.id "
+                        "ORDER BY d.created_at DESC LIMIT 5000"
+                    ).fetchall()
+                with open(export_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv_mod.writer(f)
+                    writer.writerow(["doc_id", "status", "title_before", "title_after",
+                                     "correspondent_before", "correspondent_after",
+                                     "error", "created_at", "action", "llm_model"])
+                    for row in rows:
+                        writer.writerow([
+                            row["doc_id"], row["status"], row["title_before"], row["title_after"],
+                            row["correspondent_before"], row["correspondent_after"],
+                            row["error_text"], row["created_at"], row["action"], row["llm_model"],
+                        ])
+                console.print(f"[green]Exportiert: {export_path} ({len(rows)} Eintraege)[/green]")
+            except Exception as exc:
+                console.print(f"[red]Export-Fehler: {exc}[/red]")
+
     def action_find_duplicates(self):
         """Duplikate finden."""
         if not self._init_paperless():
@@ -6123,7 +6610,7 @@ class App:
             if choice == "1":
                 if not self._init_paperless():
                     return
-                show_statistics(self.paperless)
+                show_statistics(self.paperless, run_db=self.run_db)
             elif choice == "2":
                 show_monthly_report(self.run_db, self.paperless)
             elif choice == "3":
