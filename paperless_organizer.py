@@ -9,7 +9,7 @@ Interaktive Rich Terminal-UI mit Menuesystem.
 
 from __future__ import annotations
 
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 
 import os
 import sys
@@ -50,12 +50,14 @@ TAXONOMY_FILE = os.path.join(LOG_DIR, "taxonomy_tags.json")
 LEARNING_PROFILE_FILE = os.path.join(LOG_DIR, "learning_profile.json")
 LEARNING_EXAMPLES_FILE = os.path.join(LOG_DIR, "learning_examples.jsonl")
 
+_LOG_LEVEL_MAP = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR}
+_LOG_LEVEL = _LOG_LEVEL_MAP.get(os.getenv("LOG_LEVEL", "INFO").strip().upper(), logging.INFO)
 _file_handler = logging.handlers.RotatingFileHandler(
     LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8",
 )
 _file_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S"))
 logging.basicConfig(
-    level=logging.INFO,
+    level=_LOG_LEVEL,
     format="%(asctime)s  %(message)s",
     datefmt="%H:%M:%S",
     handlers=[
@@ -254,6 +256,15 @@ class LocalStateDB:
         now = datetime.now().isoformat(timespec="seconds")
         payload = json.dumps(suggestion or {}, ensure_ascii=False)
         with self._lock, self._connect() as conn:
+            # Skip if recently resolved (within 24h) to prevent review cycles
+            recent_cutoff = (datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds")
+            recently_resolved = conn.execute(
+                "SELECT id FROM review_queue WHERE doc_id = ? AND status = 'resolved' AND updated_at > ? LIMIT 1",
+                (doc_id, recent_cutoff),
+            ).fetchone()
+            if recently_resolved:
+                return  # Don't re-enqueue recently resolved reviews
+
             existing = conn.execute(
                 "SELECT id FROM review_queue WHERE doc_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1",
                 (doc_id,),
@@ -2094,6 +2105,13 @@ def _improve_title(title: str, document: dict) -> str:
         if not deduped or w.lower() != deduped[-1].lower():
             deduped.append(w)
     title = " ".join(deduped)
+    # Remove repeated phrases (e.g., "Rechnung Nr. 123 Rechnung Nr. 123")
+    half = len(title) // 2
+    if half > 5:
+        first_half = title[:half].strip()
+        second_half = title[half:].strip()
+        if first_half.lower() == second_half.lower():
+            title = first_half
     # Remove trailing hyphens or dots
     title = title.rstrip("-. ")
     # Capitalize first letter
@@ -2922,6 +2940,26 @@ def _select_controlled_tags(suggested_tags: list, existing_tags: list, taxonomy:
         if run_db:
             run_db.record_tag_event(run_id, doc_id, "blocked", raw_tag, "blocked by tag policy (existing-only)")
 
+    # Tag conflict detection: remove conflicting tags (keep first encountered)
+    _TAG_CONFLICTS = [
+        ("privat", "arbeit"),
+        ("privat", "geschaeftlich"),
+        ("eingang", "ausgang"),
+    ]
+    approved_lower = [t.lower() for t in approved]
+    conflict_removed = []
+    for tag_a, tag_b in _TAG_CONFLICTS:
+        if tag_a in approved_lower and tag_b in approved_lower:
+            # Remove the later one
+            idx_a = approved_lower.index(tag_a)
+            idx_b = approved_lower.index(tag_b)
+            remove_idx = max(idx_a, idx_b)
+            removed_tag = approved[remove_idx]
+            conflict_removed.append(removed_tag)
+            dropped.append((removed_tag, f"konflikt mit '{approved[min(idx_a, idx_b)]}'"))
+            approved.pop(remove_idx)
+            approved_lower.pop(remove_idx)
+
     approved = approved[:MAX_TAGS_PER_DOC]
     return approved, dropped
 
@@ -3341,21 +3379,34 @@ class LocalLLMAnalyzer:
              if p["id"] == document.get("storage_path")), "")
 
         # Token-effizient: Header + Footer enthalten oft die wichtigsten Infos
+        # Smart truncation: keep high-value sections (header, footer, date/amount areas)
         content = document.get("content") or ""
         content_len = len(content)
         if compact_mode:
             if content_len > 1200:
-                # Header (Briefkopf) + Footer (Signatur/Impressum)
                 head = content[:400]
                 tail = content[-200:] if content_len > 800 else ""
-                content_preview = head + f"\n[...{content_len} Zeichen, Kompaktmodus...]\n" + tail
+                # Extract a small mid-section if it contains key patterns
+                mid_snippet = ""
+                if content_len > 1600:
+                    mid_start = content_len // 3
+                    mid_block = content[mid_start:mid_start + 400]
+                    if re.search(r"(rechnungs|invoice|betrag|amount|iban|datum|date)", mid_block, re.IGNORECASE):
+                        mid_snippet = f"\n[Mitte:] {mid_block[:200]}\n"
+                content_preview = head + mid_snippet + f"\n[...{content_len} Zeichen, Kompaktmodus...]\n" + tail
             else:
                 content_preview = content[:600]
         else:
             if content_len > 5000:
                 head = content[:1000]
                 tail = content[-400:]
-                content_preview = head + f"\n[...{content_len} Zeichen insgesamt...]\n" + tail
+                # Include mid-section with financial/date patterns
+                mid_snippet = ""
+                mid_start = content_len // 3
+                mid_block = content[mid_start:mid_start + 600]
+                if re.search(r"(rechnungs|invoice|betrag|amount|iban|datum|date|vertrag|contract)", mid_block, re.IGNORECASE):
+                    mid_snippet = f"\n[Mitte:] {mid_block[:300]}\n"
+                content_preview = head + mid_snippet + f"\n[...{content_len} Zeichen insgesamt...]\n" + tail
             elif content_len > 2000:
                 content_preview = content[:1200] + f"\n[...{content_len} Zeichen...]\n" + content[-300:]
             else:
@@ -4358,6 +4409,16 @@ def process_document(doc_id: int, paperless: PaperlessClient,
                 pass  # Keep original suggestion on error
 
     _sanitize_suggestion_spelling(suggestion)
+
+    # Fill missing correspondent from learning hints if LLM didn't identify one
+    suggested_corr = _normalize_text(str(suggestion.get("correspondent", "")))
+    if not suggested_corr and learning_hints:
+        best_hint = learning_hints[0]
+        hint_corr = _normalize_text(str(best_hint.get("correspondent", "")))
+        hint_count = int(best_hint.get("count", 0) or 0)
+        if hint_corr and hint_count >= LEARNING_PRIOR_MIN_SAMPLES:
+            suggestion["correspondent"] = hint_corr
+            log.info(f"  [cyan]Learning-Korrespondent[/cyan]: {hint_corr} (n={hint_count})")
 
     # Improve title
     orig_title = suggestion.get("title", "")
@@ -6083,6 +6144,19 @@ class App:
         taxonomy_info = f"{len(self.taxonomy.canonical_tags)} Tags"
         auto_tax = "JA" if AUTO_CREATE_TAXONOMY_TAGS else "NEIN"
         recheck_info = "JA" if RECHECK_ALL_DOCS_IN_AUTO else "NEIN"
+        # Quick organization status from cached paperless data
+        org_line = ""
+        if self.paperless:
+            try:
+                docs = self.paperless.get_documents()
+                if docs:
+                    organized = sum(1 for d in docs if _is_fully_organized(d))
+                    pct = organized / len(docs) * 100
+                    remaining = len(docs) - organized
+                    color = "green" if pct >= 90 else "yellow" if pct >= 50 else "red"
+                    org_line = f"\nOrganisiert: [{color}]{organized}/{len(docs)} ({pct:.0f}%)[/{color}] | {remaining} offen"
+            except Exception:
+                pass
         console.print(Panel(
             f"[bold]Paperless-NGX Organizer[/bold]\n"
             f"Server: {url}\n"
@@ -6090,7 +6164,8 @@ class App:
             f"Modus: {mode}\n"
             f"Tag-Policy: {tag_policy} (max {MAX_TAGS_PER_DOC})\n"
             f"Taxonomie: {taxonomy_info} | Auto-Create: {auto_tax} | Global-Limit: {MAX_TOTAL_TAGS}\n"
-            f"Auto-Modus recheck alle Dokumente: {recheck_info}\n"
+            f"Auto-Modus recheck alle Dokumente: {recheck_info}"
+            f"{org_line}\n"
             f"Learning-Profil: {LEARNING_PROFILE_FILE}\n"
             f"Learning-Beispiele: {LEARNING_EXAMPLES_FILE}\n"
             f"State-DB: {STATE_DB_FILE}",
@@ -6710,6 +6785,13 @@ class App:
                     status_table.add_row("Reviews geloest", str(total_reviews_resolved))
                     status_table.add_row("Poll-Fehler", str(total_poll_errors))
                     console.print(status_table)
+                    # Also log summary for log file persistence
+                    success_rate = (total_updated / total_candidates * 100) if total_candidates else 0
+                    log.info(
+                        f"AUTOPILOT Status Zyklus {cycle}: {uptime_min:.0f}min Laufzeit, "
+                        f"{total_updated}/{total_candidates} aktualisiert ({success_rate:.0f}%), "
+                        f"{total_doc_failures} Fehler, {total_poll_errors} Poll-Fehler"
+                    )
 
                 time.sleep(interval_sec)
         except KeyboardInterrupt:
