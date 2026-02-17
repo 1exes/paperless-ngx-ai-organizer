@@ -1,4 +1,4 @@
-# Paperless-NGX Organizer v2.2
+# Paperless-NGX Organizer v2.2.1
 
 Automatische Dokumentenorganisation fuer Paperless-NGX mit lokalem LLM (Ollama/LM Studio/OpenAI-kompatibel).
 
@@ -11,6 +11,8 @@ Automatische Dokumentenorganisation fuer Paperless-NGX mit lokalem LLM (Ollama/L
 - **Regelbasierter Fast-Path**: Bekannte Korrespondenten (10+ Beispiele, >80% konsistent) werden ohne LLM verarbeitet
 - **Fallback-Kette**: Regelbasiert -> LLM full -> LLM compact -> LLM+Websuche -> Learning-Priors -> Review-Queue
 - **Automatischer Modell-Fallback**: Wechsel auf kleineres Modell nach wiederholten Fehlern
+- **Tag-Konflikt-Erkennung**: Widersprueche (z.B. Privat+Arbeit) werden automatisch aufgeloest
+- **Learning-Korrespondent**: Fehlende Korrespondenten aus Lerndaten ergaenzen
 
 ### Intelligenz
 - **Korrespondent-Merge**: Aehnliche Namen (z.B. "Baader Bank" + "Baader Bank AG") automatisch zusammenfuehren
@@ -23,6 +25,7 @@ Automatische Dokumentenorganisation fuer Paperless-NGX mit lokalem LLM (Ollama/L
 - **Titel-Anreicherung**: Rechnungsnummern und Betraege automatisch im Titel ergaenzt
 - **Learning Decay**: Aeltere Beispiele werden weniger stark gewichtet (neuere zaehlen mehr)
 - **Similarity-basierte Few-Shot-Auswahl**: Content-Fingerprint-Aehnlichkeit fuer bessere Beispielwahl
+- **Smarte Inhalts-Trunkierung**: Mittelteil mit Finanzdaten wird fuer LLM beibehalten
 
 ### Qualitaet
 - **OCR-Qualitaetspruefung**: Erkennt schlechte OCR und markiert betroffene Dokumente zur Review
@@ -30,7 +33,7 @@ Automatische Dokumentenorganisation fuer Paperless-NGX mit lokalem LLM (Ollama/L
 - **Content-Fingerprinting**: Near-Duplicate-Erkennung via Trigram-Hashing + MinHash/LSH (skaliert bis 20.000 Dokumente)
 - **Checksum-Duplikate**: SHA256-basierte exakte Inhalts-Duplikat-Erkennung
 - **Duplikat-Erkennung**: Exakt + normalisierte Dateinamen + Titel + Checksum + Inhaltsaehnlichkeit
-- **Titel-Verbesserung**: Bereinigt LLM-generierte Titel (Endungen, Duplikate, OCR-Artefakte, Laenge)
+- **Titel-Verbesserung**: Bereinigt LLM-generierte Titel (Endungen, Duplikate, Phrasen-Wiederholungen, OCR-Artefakte, Laenge)
 - **Guardrails**: Arbeit/Privat-Trennung, Fahrzeug-Erkennung, Anbieter-Schutz
 - **Negative Learning**: Falsche Vorschlaege werden als Anti-Patterns gespeichert und kuenftig vermieden
 - **Konfidenz-Kalibrierung**: Vergleicht LLM-Konfidenz mit tatsaechlicher Genauigkeit
@@ -51,6 +54,8 @@ Automatische Dokumentenorganisation fuer Paperless-NGX mit lokalem LLM (Ollama/L
 - **CSV-Export**: Verarbeitungshistorie als CSV exportierbar
 - **LLM-Performance-Tracking**: Antwortzeiten und Erfolgsrate automatisch erfasst
 - **Fehler-Kategorisierung**: Timeout, JSON, Connection, API aufgeschluesselt
+- **Konfigurierbares Log-Level**: DEBUG/INFO/WARNING/ERROR via `.env`
+- **Organisationsgrad im Header**: Fortschritt direkt im Hauptmenue sichtbar
 
 ### Statistiken
 - **Organisationsgrad**: Vollstaendigkeit aller Dokumente
@@ -67,6 +72,7 @@ Automatische Dokumentenorganisation fuer Paperless-NGX mit lokalem LLM (Ollama/L
 - **Alters-Tracking**: Farbcodierung nach Alter (gruen <7d, gelb 7-30d, rot >30d)
 - **Dokument-Vorschau**: Inhalt und LLM-Vorschlag direkt in der Review-Queue ansehen
 - **Auto-Resolve**: Periodisches Pruefen ob Reviews inzwischen manuell erledigt wurden
+- **Duplikat-Schutz**: Kuerzlich geschlossene Reviews werden nicht erneut geoeffnet (24h Cooldown)
 
 ## Voraussetzungen
 
@@ -92,7 +98,7 @@ python paperless_organizer.py
 
 | Datei | Beschreibung |
 |-------|-------------|
-| `paperless_organizer.py` | Hauptanwendung (~7100 Zeilen) |
+| `paperless_organizer.py` | Hauptanwendung (~7250 Zeilen) |
 | `.env` | Konfiguration (nicht committen!) |
 | `.env.example` | Konfigurationsvorlage mit Dokumentation |
 | `taxonomy_tags.json` | Erlaubte Tags inkl. Synonyme und Farben |
@@ -102,7 +108,7 @@ python paperless_organizer.py
 | `organizer.log` | Laufendes Text-Log (rotiert bei 5MB) |
 | `backups/` | Learning-Daten Backups |
 | `legacy/` | Alte Einzelskripte (nur als Referenz) |
-| `test_dokumente/` | Test-PDFs fuer Entwicklung |
+| `test_dokumente/` | Test-PDFs + Generator fuer Entwicklung |
 
 ## Empfohlene Konfiguration
 
