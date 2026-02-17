@@ -9,7 +9,7 @@ Interaktive Rich Terminal-UI mit Menuesystem.
 
 from __future__ import annotations
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 import os
 import sys
@@ -142,6 +142,51 @@ class LocalStateDB:
                     FOREIGN KEY(run_id) REFERENCES runs(id)
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS confidence_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    doc_id INTEGER NOT NULL,
+                    predicted_confidence TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'llm',
+                    was_corrected INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )
+            """)
+
+    def record_confidence(self, doc_id: int, confidence: str, source: str = "llm"):
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO confidence_log (doc_id, predicted_confidence, source, created_at) VALUES (?, ?, ?, ?)",
+                (doc_id, confidence.lower(), source, now),
+            )
+
+    def mark_confidence_corrected(self, doc_id: int):
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE confidence_log SET was_corrected = 1 WHERE doc_id = ? AND was_corrected = 0 "
+                "ORDER BY id DESC LIMIT 1",
+                (doc_id,),
+            )
+
+    def get_confidence_calibration(self) -> dict:
+        """Returns calibration stats: for each confidence level, how often was it corrected."""
+        with self._lock, self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT predicted_confidence, COUNT(*) AS total, "
+                "SUM(was_corrected) AS corrected FROM confidence_log "
+                "GROUP BY predicted_confidence"
+            ).fetchall()
+            result = {}
+            for row in rows:
+                total = row["total"]
+                corrected = row["corrected"] or 0
+                accuracy = ((total - corrected) / total * 100) if total > 0 else 0.0
+                result[row["predicted_confidence"]] = {
+                    "total": total, "corrected": corrected, "accuracy": round(accuracy, 1),
+                }
+            return result
 
     def start_run(self, action: str, dry_run: bool, llm_model: str, llm_url: str) -> int:
         now = datetime.now().isoformat(timespec="seconds")
@@ -457,6 +502,8 @@ LLM_COMPACT_MAX_TOKENS = int(os.getenv("LLM_COMPACT_MAX_TOKENS", "320"))
 LLM_COMPACT_PROMPT_MAX_PATHS = int(os.getenv("LLM_COMPACT_PROMPT_MAX_PATHS", "20"))
 LLM_COMPACT_PROMPT_MAX_TAGS = int(os.getenv("LLM_COMPACT_PROMPT_MAX_TAGS", "24"))
 LLM_VERIFY_ON_LOW_CONFIDENCE = os.getenv("LLM_VERIFY_ON_LOW_CONFIDENCE", "0").strip().lower() in ("1", "true", "yes", "on")
+LLM_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "").strip()  # e.g. qwen2.5:7b as fallback for 14b
+LLM_FALLBACK_AFTER_ERRORS = int(os.getenv("LLM_FALLBACK_AFTER_ERRORS", "3"))
 
 # --- Paperless-NGX ---
 OWNER_ID = int(os.getenv("OWNER_ID", "4"))
@@ -997,6 +1044,50 @@ class LearningExamples:
         except Exception:
             self._examples = []
 
+    def validate(self) -> dict:
+        """Check integrity of learning data. Returns stats and issues found."""
+        stats = {"total": 0, "valid": 0, "invalid_json": 0, "rejected": 0,
+                 "missing_fields": 0, "duplicates": 0, "correspondents": set()}
+        seen_keys = set()
+        issues: list[str] = []
+        if not os.path.exists(self.path):
+            issues.append("Learning-Datei existiert nicht")
+            return {"stats": stats, "issues": issues}
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                for line_no, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    stats["total"] += 1
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        stats["invalid_json"] += 1
+                        issues.append(f"Zeile {line_no}: Ungültiges JSON")
+                        continue
+                    if not isinstance(row, dict):
+                        stats["invalid_json"] += 1
+                        continue
+                    if row.get("rejected"):
+                        stats["rejected"] += 1
+                    if not row.get("correspondent") and not row.get("document_type"):
+                        stats["missing_fields"] += 1
+                    # Check for duplicates (same title + correspondent + type)
+                    key = (row.get("doc_title", ""), row.get("correspondent", ""),
+                           row.get("document_type", ""), row.get("storage_path", ""))
+                    if key in seen_keys:
+                        stats["duplicates"] += 1
+                    else:
+                        seen_keys.add(key)
+                    stats["valid"] += 1
+                    if row.get("correspondent"):
+                        stats["correspondents"].add(row["correspondent"])
+        except Exception as exc:
+            issues.append(f"Lesefehler: {exc}")
+        stats["correspondents"] = len(stats["correspondents"])
+        return {"stats": stats, "issues": issues}
+
     @staticmethod
     def _tokens(text: str) -> set[str]:
         words = re.findall(r"[a-zA-Z0-9]{3,}", _strip_diacritics((text or "").lower()))
@@ -1053,6 +1144,10 @@ class LearningExamples:
         if not q_tokens:
             return []
 
+        # Content fingerprint for similarity-based scoring boost
+        q_content = (document.get("content") or "")[:2000]
+        q_fp = _content_fingerprint(q_content) if len(q_content) > 50 else set()
+
         scored = []
         for entry in self._examples[-500:]:
             if entry.get("rejected"):
@@ -1069,7 +1164,15 @@ class LearningExamples:
             overlap = len(q_tokens & e_tokens)
             if overlap <= 0:
                 continue
-            scored.append((overlap, entry))
+            # Boost score with content fingerprint similarity if available
+            score = float(overlap)
+            if q_fp and entry.get("doc_title"):
+                e_text = str(entry.get("doc_title", "")) + " " + str(entry.get("filename", ""))
+                e_fp = _content_fingerprint(e_text) if len(e_text) > 10 else set()
+                if e_fp:
+                    sim = _content_similarity(q_fp, e_fp)
+                    score += sim * 3.0  # Weight content similarity
+            scored.append((score, entry))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         unique = []
@@ -1089,6 +1192,24 @@ class LearningExamples:
                 break
         return unique
 
+    @staticmethod
+    def _entry_weight(entry: dict) -> float:
+        """Age-based weight: recent examples (last 90 days) count 1.0, older decay to 0.5."""
+        ts = entry.get("ts", "")
+        if not ts:
+            return 0.7  # Unknown age gets moderate weight
+        try:
+            entry_date = datetime.fromisoformat(ts)
+            age_days = (datetime.now() - entry_date).days
+            if age_days <= 90:
+                return 1.0
+            elif age_days <= 180:
+                return 0.75
+            else:
+                return 0.5
+        except (ValueError, TypeError):
+            return 0.7
+
     def _build_correspondent_profiles(self) -> list[dict]:
         grouped: dict[str, dict] = {}
         for entry in self._examples:
@@ -1100,27 +1221,28 @@ class LearningExamples:
             key = _normalize_tag_name(corr)
             if not key:
                 continue
+            weight = self._entry_weight(entry)
             row = grouped.setdefault(
                 key,
                 {
                     "correspondent": corr,
                     "count": 0,
-                    "doc_types": defaultdict(int),
-                    "paths": defaultdict(int),
-                    "tags": defaultdict(int),
+                    "doc_types": defaultdict(float),
+                    "paths": defaultdict(float),
+                    "tags": defaultdict(float),
                 },
             )
-            row["count"] += 1
+            row["count"] += weight
             doc_type = _normalize_text(str(entry.get("document_type", "")))
             path = _normalize_text(str(entry.get("storage_path", "")))
             if doc_type:
-                row["doc_types"][doc_type] += 1
+                row["doc_types"][doc_type] += weight
             if path:
-                row["paths"][path] += 1
+                row["paths"][path] += weight
             for t in entry.get("tags") or []:
                 tag_name = _normalize_text(str(t))
                 if tag_name:
-                    row["tags"][tag_name] += 1
+                    row["tags"][tag_name] += weight
 
         # Merge similar correspondent names (e.g. "Baader Bank" + "Baader Bank AG")
         grouped = self._merge_correspondent_variants(grouped)
@@ -1287,9 +1409,10 @@ class PaperlessClient:
         else:
             self._cache.clear()
 
-    def _get_all(self, endpoint: str) -> list:
+    def _get_all(self, endpoint: str, max_results: int = 0) -> list:
         """Alle Eintraege mit Paginierung laden."""
         results = []
+        page_num = 0
         url = f"{self.url}/api/{endpoint}/?page_size=100"
         while url:
             url = url.replace("http://", "https://")
@@ -1315,7 +1438,15 @@ class PaperlessClient:
                 raise RuntimeError(f"GET fehlgeschlagen: {url}")
             data = resp.json()
             results.extend(data.get("results", []))
+            page_num += 1
+            total_count = data.get("count", 0)
+            # Progress logging for large fetches (>500 items)
+            if total_count > 500 and page_num % 5 == 0:
+                log.info(f"  Lade {endpoint}: {len(results)}/{total_count} ({len(results) * 100 // max(1, total_count)}%)")
             url = data.get("next")
+            if max_results > 0 and len(results) >= max_results:
+                results = results[:max_results]
+                break
         return results
 
     # --- Lesen ---
@@ -2972,8 +3103,45 @@ class LocalLLMAnalyzer:
     def __init__(self, url: str = LLM_URL, model: str = LLM_MODEL):
         self.url = self._normalize_url(url)
         self.model = (model or "").strip()
+        self._original_model = self.model
         self._response_times: list[float] = []  # Track last N response times for adaptive timeout
         self._max_tracked = 50
+        self._consecutive_errors = 0
+        self._using_fallback = False
+        # Prompt fragment cache: avoid rebuilding static parts each time
+        self._prompt_cache: dict[str, str] = {}
+        self._prompt_cache_key: str = ""
+
+    def _check_model_fallback(self):
+        """Switch to fallback model after too many consecutive errors."""
+        if (
+            LLM_FALLBACK_MODEL
+            and not self._using_fallback
+            and self._consecutive_errors >= LLM_FALLBACK_AFTER_ERRORS
+        ):
+            log.warning(
+                f"[yellow]LLM-Modell-Fallback[/yellow]: {self.model} -> {LLM_FALLBACK_MODEL} "
+                f"(nach {self._consecutive_errors} Fehlern)"
+            )
+            self.model = LLM_FALLBACK_MODEL
+            self._using_fallback = True
+            self._consecutive_errors = 0
+
+    def _record_success(self):
+        """Reset error counter on success; revert to original model after 10 consecutive successes."""
+        self._consecutive_errors = 0
+        if self._using_fallback:
+            self._response_times_since_fallback = getattr(self, "_response_times_since_fallback", 0) + 1
+            if self._response_times_since_fallback >= 10:
+                log.info(f"[green]LLM-Modell zurueck auf Original[/green]: {LLM_FALLBACK_MODEL} -> {self._original_model}")
+                self.model = self._original_model
+                self._using_fallback = False
+                self._response_times_since_fallback = 0
+
+    def _record_error(self):
+        """Track consecutive errors for fallback decision."""
+        self._consecutive_errors += 1
+        self._check_model_fallback()
 
     @property
     def avg_response_time(self) -> float:
@@ -3123,26 +3291,40 @@ class LocalLLMAnalyzer:
                 learning_hints: list[dict] | None = None,
                 compact_mode: bool = False,
                 read_timeout_override: int | None = None,
-                web_hint_override: str | None = None) -> dict:
+                web_hint_override: str | None = None,
+                doc_language: str = "de") -> dict:
         """Analysiert ein Dokument und gibt Organisationsvorschlag zurueck."""
 
+        # Cache key based on list sizes - invalidate when master data changes
+        cache_key = f"{len(existing_correspondents)}:{len(existing_tags)}:{len(existing_paths)}:{compact_mode}"
+        if cache_key != self._prompt_cache_key:
+            self._prompt_cache.clear()
+            self._prompt_cache_key = cache_key
+
         # Top-Korrespondenten nach Dokumentanzahl (Token sparen)
-        top_corrs = sorted(existing_correspondents, key=lambda c: c.get("document_count", 0), reverse=True)
-        max_corr_choices = 12 if compact_mode else 35
-        corr_names = [c["name"] for c in top_corrs[:max_corr_choices]]
-        if taxonomy and ENFORCE_TAG_TAXONOMY and taxonomy.canonical_tags:
-            if compact_mode:
-                max_tag_choices = max(8, min(MAX_PROMPT_TAG_CHOICES, LLM_COMPACT_PROMPT_MAX_TAGS))
-            else:
-                max_tag_choices = min(MAX_PROMPT_TAG_CHOICES, 90)
-            tag_choices = taxonomy.prompt_tags(max_tag_choices)
+        # Use cached lists when master data hasn't changed
+        if "corr_names" in self._prompt_cache:
+            corr_names = json.loads(self._prompt_cache["corr_names"])
+            tag_choices = json.loads(self._prompt_cache["tag_choices"])
         else:
-            top_tags = sorted(existing_tags, key=lambda t: t.get("document_count", 0), reverse=True)
-            if compact_mode:
-                max_tag_choices = max(8, min(MAX_PROMPT_TAG_CHOICES, LLM_COMPACT_PROMPT_MAX_TAGS))
+            top_corrs = sorted(existing_correspondents, key=lambda c: c.get("document_count", 0), reverse=True)
+            max_corr_choices = 12 if compact_mode else 35
+            corr_names = [c["name"] for c in top_corrs[:max_corr_choices]]
+            if taxonomy and ENFORCE_TAG_TAXONOMY and taxonomy.canonical_tags:
+                if compact_mode:
+                    max_tag_choices = max(8, min(MAX_PROMPT_TAG_CHOICES, LLM_COMPACT_PROMPT_MAX_TAGS))
+                else:
+                    max_tag_choices = min(MAX_PROMPT_TAG_CHOICES, 90)
+                tag_choices = taxonomy.prompt_tags(max_tag_choices)
             else:
-                max_tag_choices = min(MAX_PROMPT_TAG_CHOICES, 90)
-            tag_choices = [t["name"] for t in top_tags[:max_tag_choices]]
+                top_tags = sorted(existing_tags, key=lambda t: t.get("document_count", 0), reverse=True)
+                if compact_mode:
+                    max_tag_choices = max(8, min(MAX_PROMPT_TAG_CHOICES, LLM_COMPACT_PROMPT_MAX_TAGS))
+                else:
+                    max_tag_choices = min(MAX_PROMPT_TAG_CHOICES, 90)
+                tag_choices = [t["name"] for t in top_tags[:max_tag_choices]]
+            self._prompt_cache["corr_names"] = json.dumps(corr_names, ensure_ascii=False)
+            self._prompt_cache["tag_choices"] = json.dumps(tag_choices, ensure_ascii=False)
 
         current_tags = [
             t["name"] for t in existing_tags
@@ -3248,7 +3430,34 @@ class LocalLLMAnalyzer:
         path_names = [p["name"] for p in existing_paths if "Duplikat" not in p["name"]]
         if compact_mode:
             path_names = path_names[:max(8, LLM_COMPACT_PROMPT_MAX_PATHS)]
-            prompt = f"""Paperless-NGX: Dokument klassifizieren und zuordnen.
+            if doc_language == "en":
+                prompt = f"""Paperless-NGX: Classify and assign document.
+DOCUMENT #{document['id']}:
+Title: {document.get('title', '?')} | File: {document.get('original_file_name', '?')}
+Current: Tags={current_tags or 'none'} | Corr={current_corr or 'none'} | Type={current_type or 'none'} | Path={current_path or 'none'}
+{f'WEB CONTEXT: {web_hint}' if web_hint else ''}
+
+CONTENT (EXCERPT):
+{content_preview}
+
+ALLOWED CORRESPONDENTS: {', '.join(corr_names)}
+ALLOWED DOCUMENT TYPES: {', '.join(ALLOWED_DOC_TYPES)}
+ALLOWED STORAGE PATHS: {', '.join(path_names)}
+ALLOWED TAGS: {', '.join(tag_choices)}
+
+FIELDS (all required):
+- title: Descriptive German title (e.g. "Rechnung Telekom Februar 2025")
+- correspondent: The SPECIFIC sender (company/authority) from letterhead, MUST be from the list
+- document_type: Document type, MUST be from the list
+- storage_path: Category path EXACTLY from the list
+- tags: 1-{MAX_TAGS_PER_DOC} tags ONLY from the list
+- confidence: "high", "medium", or "low"
+- reasoning: Brief explanation
+
+JSON ONLY:
+{{"title": "Title", "tags": ["Tag1"], "correspondent": "Company", "document_type": "Type", "storage_path_name": "Category", "storage_path": "Category/Sub", "confidence": "high", "reasoning": "Brief"}}"""
+            else:
+                prompt = f"""Paperless-NGX: Dokument klassifizieren und zuordnen.
 DOKUMENT #{document['id']}:
 Titel: {document.get('title', '?')} | Datei: {document.get('original_file_name', '?')}
 Aktuell: Tags={current_tags or 'keine'} | Korr={current_corr or 'keiner'} | Typ={current_type or 'keiner'} | Pfad={current_path or 'keiner'}
@@ -3642,11 +3851,13 @@ Antworte NUR mit korrigiertem JSON (oder identischem wenn alles stimmt):
                     resp = retry_resp
 
         if not resp.ok:
+            self._record_error()
             detail = self._error_snippet(resp)
             raise requests.HTTPError(
                 f"{resp.status_code} {resp.reason} for url: {self.url} | body: {detail}",
                 response=resp,
             )
+        self._record_success()
         return self._extract_response_text(resp.json())
 
 
@@ -3872,12 +4083,22 @@ def show_suggestion(document: dict, suggestion: dict, asn: int | None,
         asn_suggestion,
     )
 
-    # Confidence display
+    # Confidence display with color-coding and source
     conf = suggestion.get("confidence", "").lower()
     conf_style = {"high": "[bold green]HOCH[/bold green]", "medium": "[yellow]MITTEL[/yellow]",
-                  "low": "[red]NIEDRIG[/red]"}.get(conf, conf)
+                  "low": "[red]NIEDRIG[/red]", "prior_only": "[cyan]NUR PRIOR[/cyan]"}.get(conf, conf)
+    # Determine source label
+    source = suggestion.get("_source", "")
+    if not source:
+        if conf == "prior_only":
+            source = "Learning-Prior"
+        elif suggestion.get("_rule_based"):
+            source = "Regelbasiert"
+        else:
+            source = "LLM"
+    source_label = f" [dim]({source})[/dim]" if source else ""
     if conf:
-        table.add_row("Konfidenz", "", conf_style)
+        table.add_row("Konfidenz", "", f"{conf_style}{source_label}")
 
     console.print(table)
     if suggestion.get("reasoning"):
@@ -3943,6 +4164,7 @@ def process_document(doc_id: int, paperless: PaperlessClient,
     # Rule-based fast path: skip LLM for well-known correspondent patterns
     rule_suggestion = _try_rule_based_suggestion(document, learning_hints, storage_paths)
     if rule_suggestion:
+        rule_suggestion["_rule_based"] = True
         log.info(f"  [green]Regelbasiert[/green] (LLM uebersprungen): {rule_suggestion.get('correspondent')}")
         if run_db and run_id:
             run_db.record_document(run_id, doc_id, "rule_based", document, suggestion=rule_suggestion)
@@ -3966,6 +4188,7 @@ def process_document(doc_id: int, paperless: PaperlessClient,
                 few_shot_examples=[] if initial_compact else few_shot_examples,
                 learning_hints=learning_hints,
                 compact_mode=initial_compact,
+                doc_language=doc_lang,
             )
         except json.JSONDecodeError as e:
             log.error(f"  JSON-Parse-Fehler: {e}")
@@ -3992,6 +4215,7 @@ def process_document(doc_id: int, paperless: PaperlessClient,
                         learning_hints=learning_hints,
                         compact_mode=True,
                         read_timeout_override=retry_timeout,
+                        doc_language=doc_lang,
                     )
                 except requests.exceptions.Timeout:
                     log.error(f"  Timeout im Kompaktmodus: LLM hat zu lange gebraucht (Server: {analyzer.url}).")
@@ -4019,6 +4243,7 @@ def process_document(doc_id: int, paperless: PaperlessClient,
                         few_shot_examples=[],
                         learning_hints=learning_hints,
                         compact_mode=True,
+                        doc_language=doc_lang,
                     )
                 except requests.exceptions.Timeout:
                     if _is_fully_organized(document):
@@ -4054,6 +4279,7 @@ def process_document(doc_id: int, paperless: PaperlessClient,
                     few_shot_examples=[],
                     learning_hints=learning_hints,
                     compact_mode=True,
+                    doc_language=doc_lang,
                 )
             except requests.exceptions.RequestException:
                 log.error(f"  LLM nicht erreichbar! Endpoint: {analyzer.url}")
@@ -4085,6 +4311,7 @@ def process_document(doc_id: int, paperless: PaperlessClient,
                     learning_hints=learning_hints,
                     compact_mode=True,
                     web_hint_override=web_context,
+                    doc_language=doc_lang,
                 )
             except Exception:
                 suggestion = None
@@ -4122,6 +4349,7 @@ def process_document(doc_id: int, paperless: PaperlessClient,
                     learning_hints=learning_hints,
                     compact_mode=True,
                     web_hint_override=web_context,
+                    doc_language=doc_lang,
                 )
                 if verified and _normalize_text(str(verified.get("correspondent", ""))):
                     suggestion = verified
@@ -4251,6 +4479,10 @@ def process_document(doc_id: int, paperless: PaperlessClient,
         log.info(f"[bold green]FERTIG[/bold green] Dokument #{doc_id} aktualisiert -> {result_label} ({t_total:.1f}s gesamt)")
         if run_db and run_id:
             run_db.record_document(run_id, doc_id, "updated", document, suggestion=suggestion)
+            # Track confidence for calibration
+            conf = (suggestion.get("confidence") or "high").lower()
+            source = "rule_based" if rule_suggestion else "llm"
+            run_db.record_confidence(doc_id, conf, source=source)
         if learning_profile:
             try:
                 learning_profile.learn_from_document(document, suggestion)
@@ -4378,6 +4610,8 @@ def auto_organize_all(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
     batch_start = time.perf_counter()
     applied = 0
     errors = 0
+    error_categories: dict[str, int] = defaultdict(int)
+    doc_times: list[float] = []
 
     if AGENT_WORKERS <= 1:
         with Progress(
@@ -4391,8 +4625,17 @@ def auto_organize_all(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
         ) as progress:
             task = progress.add_task("Sortiere...", total=len(todo))
             for i, doc in enumerate(todo, 1):
-                progress.update(task, description=f"[{i}/{len(todo)}] #{doc['id']}")
+                # Calculate ETA from running average
+                if doc_times:
+                    avg_t = sum(doc_times) / len(doc_times)
+                    eta_sec = avg_t * (len(todo) - i + 1)
+                    eta_min = eta_sec / 60
+                    eta_str = f" | ETA {eta_min:.0f}m" if eta_min >= 1 else f" | ETA {eta_sec:.0f}s"
+                else:
+                    eta_str = ""
+                progress.update(task, description=f"[{i}/{len(todo)}] #{doc['id']}{eta_str}")
                 log.info(f"[bold]--- {i}/{len(todo)} --- Dokument #{doc['id']}[/bold]")
+                doc_t0 = time.perf_counter()
                 try:
                     if process_document(doc["id"], paperless, analyzer, tags, correspondents,
                                         doc_types, storage_paths, dry_run, batch_mode=not dry_run,
@@ -4405,7 +4648,20 @@ def auto_organize_all(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
                         applied += 1
                 except Exception as e:
                     errors += 1
+                    # Categorize error
+                    err_str = str(e).lower()
+                    if "timeout" in err_str:
+                        error_categories["timeout"] += 1
+                    elif "json" in err_str:
+                        error_categories["json_parse"] += 1
+                    elif "connection" in err_str or "connect" in err_str:
+                        error_categories["connection"] += 1
+                    elif "status" in err_str or "http" in err_str:
+                        error_categories["api_error"] += 1
+                    else:
+                        error_categories["other"] += 1
                     log.error(f"Fehler bei #{doc['id']}: {e}")
+                doc_times.append(time.perf_counter() - doc_t0)
                 progress.advance(task)
     else:
         log.info(f"[bold]PARALLEL[/bold] Starte {AGENT_WORKERS} Agent-Worker")
@@ -4453,8 +4709,13 @@ def auto_organize_all(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
 
     batch_elapsed = time.perf_counter() - batch_start
     avg_time = (batch_elapsed / len(todo)) if todo else 0
+    throughput = (len(todo) / batch_elapsed * 60) if batch_elapsed > 0 else 0
     log.info(f"[bold]AUTO-SORTIERUNG FERTIG[/bold] - {applied}/{len(todo)} aktualisiert, "
-             f"{errors} Fehler, {batch_elapsed:.1f}s gesamt ({avg_time:.1f}s/Dokument)")
+             f"{errors} Fehler, {batch_elapsed:.1f}s gesamt ({avg_time:.1f}s/Dokument, "
+             f"{throughput:.1f} Dok/min)")
+    if error_categories:
+        cats = ", ".join(f"{k}={v}" for k, v in sorted(error_categories.items(), key=lambda x: x[1], reverse=True))
+        log.info(f"  Fehler-Aufschluesselung: {cats}")
     if AUTO_CLEANUP_AFTER_ORGANIZE and not dry_run:
         log.info("[bold]AUTO-CLEANUP[/bold] nach Auto-Sortierung gestartet")
         cleanup_tags(paperless, dry_run=False)
@@ -5301,6 +5562,10 @@ def show_statistics(paperless: PaperlessClient, run_db: LocalStateDB | None = No
             table_paths.add_row(p["name"], str(count), f"{pct:.1f}%")
         if empty_paths:
             table_paths.add_row(f"[dim]({len(empty_paths)} leere Pfade)[/dim]", "", "")
+            # Show names of empty paths for cleanup reference
+            if len(empty_paths) <= 10:
+                for ep in empty_paths:
+                    table_paths.add_row(f"  [red]{ep['name']}[/red]", "[red]0[/red]", "[red]leer[/red]")
         console.print(table_paths)
 
     # Tag co-occurrence analysis
@@ -5374,6 +5639,27 @@ def show_statistics(paperless: PaperlessClient, run_db: LocalStateDB | None = No
                 for err in stats["top_errors"]:
                     err_table.add_row(err["error"], str(err["count"]))
                 console.print(err_table)
+
+            # Confidence calibration
+            try:
+                cal = run_db.get_confidence_calibration()
+                if cal:
+                    cal_table = Table(title="Konfidenz-Kalibrierung", show_header=True, width=60)
+                    cal_table.add_column("Konfidenz", style="cyan")
+                    cal_table.add_column("Gesamt", justify="right")
+                    cal_table.add_column("Korrigiert", justify="right")
+                    cal_table.add_column("Genauigkeit", justify="right", style="bold")
+                    for level in ["high", "medium", "low"]:
+                        if level in cal:
+                            d = cal[level]
+                            acc_color = "green" if d["accuracy"] >= 80 else ("yellow" if d["accuracy"] >= 60 else "red")
+                            cal_table.add_row(
+                                level, str(d["total"]), str(d["corrected"]),
+                                f"[{acc_color}]{d['accuracy']}%[/{acc_color}]",
+                            )
+                    console.print(cal_table)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -5594,6 +5880,12 @@ def learn_from_review(review_id: int, run_db: LocalStateDB,
             log.info(f"  Learning-Profil aktualisiert fuer Dokument #{doc_id}")
         except Exception as exc:
             log.warning(f"  Learning-Profil konnte nicht aktualisiert werden: {exc}")
+
+    # Mark confidence calibration as corrected if review required manual intervention
+    try:
+        run_db.mark_confidence_corrected(doc_id)
+    except Exception:
+        pass  # Best-effort calibration tracking
 
     run_db.close_review(review_id)
     _remove_review_tag_from_document(paperless, document)
@@ -6299,6 +6591,17 @@ class App:
                     total_seen_new += len(new_ids)
                     log.info(f"AUTOPILOT: {len(new_ids)} neue Dokumente erkannt")
 
+                    # Smart scheduling: prioritize time-sensitive documents
+                    def _doc_priority(did: int) -> int:
+                        d = docs_by_id.get(did, {})
+                        hints = _detect_content_hints(d)
+                        if "invoice_detected" in hints or "iban_present" in hints:
+                            return 0  # Invoices first (time-sensitive)
+                        if "contract_detected" in hints or "insurance_detected" in hints:
+                            return 1  # Contracts/insurance second
+                        return 2  # Everything else
+                    new_ids = sorted(new_ids, key=_doc_priority)
+
                     try:
                         tags, correspondents, doc_types, storage_paths = self._load_master_data()
                         self._ensure_taxonomy_tags(tags)
@@ -6479,6 +6782,7 @@ class App:
             ("11", "Learning-Daten sichern (Backup)"),
             ("12", "Datenbank bereinigen (alte Runs loeschen)"),
             ("13", "Verarbeitungshistorie exportieren (CSV)"),
+            ("14", "Learning-Daten Integritaetspruefung"),
             ("0", "Zurueck"),
         ])
 
@@ -6592,6 +6896,26 @@ class App:
             except Exception as exc:
                 console.print(f"[red]Export-Fehler: {exc}[/red]")
 
+        elif choice == "14":
+            result = self.learning_examples.validate()
+            s = result["stats"]
+            table = Table(title="Learning-Daten Integritaet", show_header=True, width=50)
+            table.add_column("Metrik", style="cyan")
+            table.add_column("Wert", justify="right", style="bold")
+            table.add_row("Eintraege gesamt", str(s["total"]))
+            table.add_row("Valide", f"[green]{s['valid']}[/green]")
+            table.add_row("Ungültiges JSON", f"[red]{s['invalid_json']}[/red]" if s["invalid_json"] else "0")
+            table.add_row("Abgelehnte (Anti-Pattern)", str(s["rejected"]))
+            table.add_row("Fehlende Felder", str(s["missing_fields"]))
+            table.add_row("Duplikate", f"[yellow]{s['duplicates']}[/yellow]" if s["duplicates"] else "0")
+            table.add_row("Korrespondenten", str(s["correspondents"]))
+            console.print(table)
+            if result["issues"]:
+                for issue in result["issues"][:10]:
+                    console.print(f"  [yellow]Problem:[/yellow] {issue}")
+            else:
+                console.print("[green]Keine Probleme gefunden.[/green]")
+
     def action_find_duplicates(self):
         """Duplikate finden."""
         if not self._init_paperless():
@@ -6647,13 +6971,33 @@ class App:
         table.add_column("ID", width=6)
         table.add_column("Dokument", width=10)
         table.add_column("Grund")
+        table.add_column("Alter", width=8)
         table.add_column("Aktualisiert", width=20)
         for item in open_items:
-            table.add_row(str(item["id"]), str(item["doc_id"]), item["reason"], item["updated_at"])
+            # Age color-coding: green <7d, yellow 7-30d, red >30d
+            age_days = 0
+            try:
+                created = datetime.fromisoformat(item["created_at"])
+                age_days = (datetime.now() - created).days
+            except (ValueError, TypeError):
+                pass
+            if age_days > 30:
+                age_str = f"[red]{age_days}d[/red]"
+            elif age_days > 7:
+                age_str = f"[yellow]{age_days}d[/yellow]"
+            else:
+                age_str = f"[green]{age_days}d[/green]"
+            table.add_row(str(item["id"]), str(item["doc_id"]), item["reason"], age_str, item["updated_at"])
         console.print(table)
         if not open_items:
             return
-        if Confirm.ask("Einen Review-Eintrag als erledigt markieren?", default=False):
+        action = self._menu("Review-Aktion", [
+            ("1", "Einzelnen Review schliessen"),
+            ("2", "Alle Reviews batch-pruefen (auto-resolve + lernen)"),
+            ("3", "Dokument-Vorschau anzeigen"),
+            ("0", "Zurueck"),
+        ])
+        if action == "1":
             review_id_str = Prompt.ask("Review-ID")
             try:
                 review_id = int(review_id_str)
@@ -6676,11 +7020,126 @@ class App:
                 console.print("[green]Review-Eintrag geschlossen (Dokument noch nicht fertig organisiert).[/green]")
             else:
                 console.print("[yellow]Kein offener Eintrag mit dieser ID gefunden.[/yellow]")
+        elif action == "2":
+            if not self._init_paperless():
+                return
+            resolved = 0
+            failed = 0
+            with Progress(
+                SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                BarColumn(), TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                console=console, transient=True,
+            ) as progress:
+                task = progress.add_task("Reviews pruefen...", total=len(open_items))
+                for item in open_items:
+                    progress.update(task, description=f"Review #{item['id']} (Doc #{item['doc_id']})")
+                    try:
+                        if learn_from_review(
+                            item["id"], self.run_db, self.paperless,
+                            self.learning_profile, self.learning_examples,
+                        ):
+                            resolved += 1
+                    except Exception:
+                        failed += 1
+                    progress.advance(task)
+            console.print(
+                f"[green]{resolved} geschlossen + gelernt[/green], "
+                f"{len(open_items) - resolved - failed} noch offen, "
+                f"{failed} Fehler"
+            )
+        elif action == "3":
+            preview_id_str = Prompt.ask("Review-ID fuer Vorschau")
+            try:
+                preview_id = int(preview_id_str)
+            except ValueError:
+                console.print("[red]Ungueltige ID.[/red]")
+                return
+            review = self.run_db.get_review_with_suggestion(preview_id)
+            if not review:
+                console.print("[yellow]Kein Review mit dieser ID gefunden.[/yellow]")
+                return
+            doc_id = review["doc_id"]
+            if not self._init_paperless():
+                return
+            try:
+                doc = self.paperless.get_document(doc_id)
+            except Exception as exc:
+                console.print(f"[red]Dokument #{doc_id} nicht ladbar: {exc}[/red]")
+                return
+            # Show document preview
+            console.print(Panel(
+                f"[bold]Titel:[/bold] {doc.get('title', '?')}\n"
+                f"[bold]Datei:[/bold] {doc.get('original_file_name', '?')}\n"
+                f"[bold]Erstellt:[/bold] {doc.get('created', '?')}\n"
+                f"[bold]Korrespondent-ID:[/bold] {doc.get('correspondent', 'keiner')}\n"
+                f"[bold]Tags:[/bold] {doc.get('tags', [])}\n"
+                f"[bold]Typ:[/bold] {doc.get('document_type', 'keiner')}\n"
+                f"[bold]Pfad:[/bold] {doc.get('storage_path', 'keiner')}",
+                title=f"Dokument #{doc_id}",
+                border_style="cyan",
+            ))
+            content = (doc.get("content") or "")[:500]
+            if content:
+                console.print(Panel(content, title="Inhalt (erste 500 Zeichen)", border_style="dim"))
+            # Show original suggestion
+            sugg = review.get("suggestion_json", "")
+            if isinstance(sugg, str) and sugg:
+                try:
+                    sugg_dict = json.loads(sugg)
+                    console.print(Panel(
+                        json.dumps(sugg_dict, indent=2, ensure_ascii=False)[:600],
+                        title="Urspruenglicher LLM-Vorschlag",
+                        border_style="yellow",
+                    ))
+                except (json.JSONDecodeError, TypeError):
+                    pass
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Main
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+def _show_startup_health():
+    """Quick health check displayed at startup."""
+    checks = []
+    # State DB size
+    if os.path.exists(STATE_DB_FILE):
+        db_size_mb = os.path.getsize(STATE_DB_FILE) / (1024 * 1024)
+        checks.append(f"  State-DB: {db_size_mb:.1f} MB")
+    # Learning examples count
+    if os.path.exists(LEARNING_EXAMPLES_FILE):
+        try:
+            with open(LEARNING_EXAMPLES_FILE, "r", encoding="utf-8") as f:
+                n_examples = sum(1 for _ in f)
+            checks.append(f"  Learning-Beispiele: {n_examples}")
+        except Exception:
+            pass
+    # Taxonomy tags count
+    if os.path.exists(TAXONOMY_FILE):
+        try:
+            with open(TAXONOMY_FILE, "r", encoding="utf-8") as f:
+                tax_data = json.load(f)
+            checks.append(f"  Taxonomie-Tags: {len(tax_data.get('tags', {}))}")
+        except Exception:
+            pass
+    # Last successful run
+    try:
+        db = LocalStateDB(STATE_DB_FILE)
+        with db._connect() as conn:
+            row = conn.execute(
+                "SELECT started_at FROM runs WHERE ended_at IS NOT NULL ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                checks.append(f"  Letzter Run: {row[0]}")
+            # Open reviews
+            row2 = conn.execute("SELECT COUNT(*) FROM review_queue WHERE status = 'open'").fetchone()
+            if row2 and row2[0] > 0:
+                checks.append(f"  Offene Reviews: [yellow]{row2[0]}[/yellow]")
+    except Exception:
+        pass
+    for c in checks:
+        log.info(c)
+
 
 def main():
     log.info("=" * 40)
@@ -6689,6 +7148,7 @@ def main():
     log.info(f"  LLM: {LLM_MODEL or '(auto)'} @ {LLM_URL}")
     log.info(f"  Log-Datei: {LOG_FILE}")
     log.info(f"  State-DB: {STATE_DB_FILE}")
+    _show_startup_health()
     log.info("=" * 40)
     app = App()
     try:
