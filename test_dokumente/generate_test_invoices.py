@@ -19,9 +19,9 @@ from __future__ import annotations
 import os
 from fpdf import FPDF
 
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_dokumente")
+OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-EMPFAENGER = ("Edgar Richter", "Musterstrasse 42", "01099 Dresden")
+EMPFAENGER = ("Max Mustermann", "Musterstrasse 42", "01099 Dresden")
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +367,7 @@ DOCUMENTS = [
             "Invoice Date:": "01.02.2025",
             "Invoice No.:": "JB-INV-2025-22847",
             "License ID:": "JB-LIC-2025-98413",
-            "Customer:": "Edgar Richter",
+            "Customer:": "Max Mustermann",
         },
         "footer": [
             "JetBrains s.r.o.\nNa Hrebenech II 1718/10\n140 00 Prague 4, Czech Republic",
@@ -407,7 +407,7 @@ DOCUMENTS = [
             "Datum:": "15.12.2024",
             "Versicherungsnr.:": "KH-7234-9182-01",
             "Fahrzeug:": "VW Polo 1.0 TSI",
-            "Kennzeichen:": "DD-ER 421",
+            "Kennzeichen:": "DD-MM 123",
             "SF-Klasse:": "SF 8",
             "Zeitraum:": "01.01. - 31.12.2025",
         },
@@ -448,8 +448,8 @@ DOCUMENTS = [
         "accent_color": "#e1f5fe",
         "info_block": {
             "Untersuchungsdatum:": "22.01.2025",
-            "Patient:": "Edgar Richter",
-            "Geb.:": "15.03.1990",
+            "Patient:": "Max Mustermann",
+            "Geb.:": "01.01.1985",
             "Versicherung:": "AOK PLUS",
             "Vers.-Nr.:": "A123456789",
         },
@@ -470,7 +470,7 @@ DOCUMENTS = [
         "info_block": {
             "Stichtag:": "31.01.2025",
             "Depotnummer:": "SC-DE-2847193",
-            "Depotinhaber:": "Edgar Richter",
+            "Depotinhaber:": "Max Mustermann",
             "Depotbank:": "Baader Bank AG",
         },
         "footer": [
@@ -512,7 +512,7 @@ DOCUMENTS = [
             "Mietvertragsnr.:": "VON-DD-2021-08834",
             "Objekt:": "Musterstr. 42, Dresden",
             "Wohnflaeche:": "62,5 m2",
-            "Mieterin/Mieter:": "Edgar Richter",
+            "Mieterin/Mieter:": "Max Mustermann",
         },
         "footer": [
             "Vonovia SE\nUniversitaetsstrasse 133\n44803 Bochum",
@@ -532,7 +532,7 @@ DOCUMENTS = [
             "Datum:": "28.01.2025",
             "Versichertennr.:": "A123456789",
             "Bonusjahr:": "2024",
-            "Versicherter:": "Edgar Richter",
+            "Versicherter:": "Max Mustermann",
         },
         "footer": [
             "AOK PLUS\nDie Gesundheitskasse fuer\nSachsen und Thueringen",
@@ -551,7 +551,7 @@ DOCUMENTS = [
         "info_block": {
             "Datum:": "15.01.2025",
             "Steuernummer:": "203/123/45678",
-            "Steuerpflichtiger:": "Edgar Richter",
+            "Steuerpflichtiger:": "Max Mustermann",
             "Veranlagungsjahr:": "2023",
             "Sachbearbeiter/in:": "Fr. Bergmann",
             "Tel. Durchwahl:": "0351 / 8855-7412",
@@ -573,7 +573,7 @@ DOCUMENTS = [
         "info_block": {
             "Rechnungsdatum:": "12.02.2025",
             "Rechnungsnr.:": "FS-2025-0294",
-            "Fahrschueler:": "Edgar Richter",
+            "Fahrschueler:": "Max Mustermann",
             "Klasse:": "A2 (Aufstieg A1)",
         },
         "footer": [
@@ -614,7 +614,7 @@ def _gen_telekom(pdf: BusinessPDF, doc: dict):
     pdf.add_info_block()
     pdf.add_subject("Ihre Mobilfunkrechnung - Februar 2025")
     pdf.add_paragraph(
-        "Sehr geehrter Herr Richter,\n\n"
+        "Sehr geehrter Herr Mustermann,\n\n"
         "anbei erhalten Sie Ihre Mobilfunkrechnung fuer den Abrechnungszeitraum "
         "01.02.2025 bis 28.02.2025."
     )
@@ -646,7 +646,7 @@ def _gen_amazon(pdf: BusinessPDF, doc: dict):
     pdf.add_address_block()
     pdf.add_info_block()
     pdf.add_subject("Rechnung zu Ihrer Bestellung 302-4418823-9912654")
-    pdf.add_paragraph("Lieferadresse: Edgar Richter, Musterstrasse 42, 01099 Dresden")
+    pdf.add_paragraph("Lieferadresse: Max Mustermann, Musterstrasse 42, 01099 Dresden")
     pdf.add_table(
         headers=["Pos.", "Artikel", "Menge", "Einzelpreis", "Gesamt"],
         col_widths=[15, 95, 18, 30, 32],
@@ -674,7 +674,7 @@ def _gen_stadtwerke(pdf: BusinessPDF, doc: dict):
     pdf.add_info_block()
     pdf.add_subject("Jahresabrechnung Strom 2024")
     pdf.add_paragraph(
-        "Sehr geehrter Herr Richter,\n\n"
+        "Sehr geehrter Herr Mustermann,\n\n"
         "hiermit erhalten Sie Ihre Jahresabrechnung fuer Strom fuer den Zeitraum "
         "01.01.2024 bis 31.12.2024."
     )
@@ -713,7 +713,7 @@ def _gen_jetbrains(pdf: BusinessPDF, doc: dict):
     pdf.add_address_block()
     pdf.add_info_block()
     pdf.add_subject("Invoice - IntelliJ IDEA Ultimate Subscription")
-    pdf.add_paragraph("Bill to: Edgar Richter, Dresden, Germany")
+    pdf.add_paragraph("Bill to: Max Mustermann, Dresden, Germany")
     pdf.add_table(
         headers=["Item", "Period", "Qty", "Amount"],
         col_widths=[70, 55, 20, 45],
@@ -767,9 +767,9 @@ def _gen_huk(pdf: BusinessPDF, doc: dict):
     pdf.add_info_block()
     pdf.add_subject("Beitragsrechnung Kfz-Versicherung 2025")
     pdf.add_paragraph(
-        "Sehr geehrter Herr Richter,\n\n"
+        "Sehr geehrter Herr Mustermann,\n\n"
         "nachfolgend erhalten Sie Ihre Beitragsrechnung fuer die Kfz-Versicherung "
-        "Ihres Fahrzeugs VW Polo 1.0 TSI (Kennzeichen: DD-ER 421)."
+        "Ihres Fahrzeugs VW Polo 1.0 TSI (Kennzeichen: DD-MM 123)."
     )
     pdf.add_table(
         headers=["Versicherungsart", "Selbstbeteiligung", "Jahresbeitrag"],
@@ -798,7 +798,7 @@ def _gen_wbs(pdf: BusinessPDF, doc: dict):
     pdf.ln(2)
 
     pdf.add_paragraph(
-        "Mitarbeiter: Edgar Richter\n"
+        "Mitarbeiter: Max Mustermann\n"
         "Personalnummer: WBS-2025-0842\n"
         "Steuerklasse: I / 0,5 Kinderfreibetrag\n"
         "Konfession: ev\n"
@@ -837,7 +837,7 @@ def _gen_augenarzt(pdf: BusinessPDF, doc: dict):
     pdf.add_info_block()
     pdf.add_subject("Befundbericht - Augenarztliche Routineuntersuchung")
     pdf.add_paragraph(
-        "Patient: Edgar Richter, geb. 15.03.1990\n"
+        "Patient: Max Mustermann, geb. 01.01.1985\n"
         "Untersuchungsdatum: 22.01.2025\n"
         "Anlass: Routineuntersuchung / Vorsorge"
     )
@@ -865,7 +865,7 @@ def _gen_scalable(pdf: BusinessPDF, doc: dict):
     pdf.add_address_block()
     pdf.add_info_block()
     pdf.add_subject("Depotauszug per 31.01.2025")
-    pdf.add_paragraph("Depotinhaber: Edgar Richter | Depotnummer: SC-DE-2847193 | Depotbank: Baader Bank AG")
+    pdf.add_paragraph("Depotinhaber: Max Mustermann | Depotnummer: SC-DE-2847193 | Depotbank: Baader Bank AG")
     pdf.add_table(
         headers=["ISIN", "Fondsname", "Anteile", "Kurs EUR", "Wert EUR"],
         col_widths=[32, 62, 24, 32, 40],
@@ -897,7 +897,7 @@ def _gen_drk(pdf: BusinessPDF, doc: dict):
     pdf.ln(4)
     pdf.add_paragraph(
         "Hiermit bescheinigen wir, dass\n\n"
-        "    Edgar Richter, geb. 15.03.1990\n\n"
+        "    Max Mustermann, geb. 01.01.1985\n\n"
         "seit dem 01.04.2018 aktives Mitglied des DRK Kreisverband Dresden e.V. ist."
     )
     pdf.add_table(
@@ -924,7 +924,7 @@ def _gen_vonovia(pdf: BusinessPDF, doc: dict):
     pdf.add_info_block()
     pdf.add_subject("Mietanpassung zum 01.04.2025")
     pdf.add_paragraph(
-        "Sehr geehrter Herr Richter,\n\n"
+        "Sehr geehrter Herr Mustermann,\n\n"
         "hiermit teilen wir Ihnen die Anpassung Ihrer monatlichen Miete "
         "gemaess Paragraph 558 BGB mit."
     )
@@ -955,7 +955,7 @@ def _gen_aok(pdf: BusinessPDF, doc: dict):
     pdf.add_info_block()
     pdf.add_subject("Bonusprogramm - Jahresabrechnung 2024")
     pdf.add_paragraph(
-        "Sehr geehrter Herr Richter,\n\n"
+        "Sehr geehrter Herr Mustermann,\n\n"
         "herzlichen Glueckwunsch! Hier ist Ihre Bonuspunkte-Abrechnung fuer das Jahr 2024."
     )
     pdf.add_table(
@@ -1027,7 +1027,7 @@ def _gen_fahrschule(pdf: BusinessPDF, doc: dict):
     pdf.add_address_block()
     pdf.add_info_block()
     pdf.add_subject("Rechnung - Aufstieg Klasse A1 auf A2")
-    pdf.add_paragraph("Fahrschueler: Edgar Richter\nFuehrerscheinklasse: A2 (Aufstieg von A1)")
+    pdf.add_paragraph("Fahrschueler: Max Mustermann\nFuehrerscheinklasse: A2 (Aufstieg von A1)")
     pdf.add_table(
         headers=["Pos.", "Leistung", "Anzahl", "Einzelpreis", "Gesamt"],
         col_widths=[15, 80, 20, 35, 40],
@@ -1049,7 +1049,7 @@ def _gen_fahrschule(pdf: BusinessPDF, doc: dict):
     pdf.add_paragraph(
         "Bankverbindung: Ostsaechsische Sparkasse Dresden\n"
         "IBAN: DE12 8505 0300 0221 1234 56\n"
-        "Verwendungszweck: FS-2025-0294 / Richter\n\n"
+        "Verwendungszweck: FS-2025-0294 / Mustermann\n\n"
         "Vielen Dank und allzeit gute Fahrt!\nFahrschule Schmidt"
     )
 
@@ -1074,7 +1074,7 @@ def _gen_eventim(pdf: BusinessPDF, doc: dict):
         total_row=["Gesamtbetrag:", "121,90 EUR"],
     )
     pdf.ln(3)
-    pdf.add_highlight_box("Bezahlt am 18.01.2025 via PayPal (edgar.richter@email.de)", "success")
+    pdf.add_highlight_box("Bezahlt am 18.01.2025 via PayPal (max.mustermann@example.de)", "success")
     pdf.add_paragraph(
         "Ihr E-Ticket wurde an Ihre E-Mail-Adresse gesendet. Bitte bringen Sie "
         "einen gueltigen Lichtbildausweis zur Veranstaltung mit.\n\n"

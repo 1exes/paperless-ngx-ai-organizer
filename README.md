@@ -1,4 +1,4 @@
-# Paperless-NGX Organizer v2.2.1
+# Paperless-NGX Organizer v3.0.0
 
 Automatische Dokumentenorganisation fuer Paperless-NGX mit lokalem LLM (Ollama/LM Studio/OpenAI-kompatibel).
 
@@ -53,26 +53,6 @@ Automatische Dokumentenorganisation fuer Paperless-NGX mit lokalem LLM (Ollama/L
 - **Learning-Integritaetspruefung**: Validiert Learning-Daten auf Fehler und Duplikate
 - **CSV-Export**: Verarbeitungshistorie als CSV exportierbar
 - **LLM-Performance-Tracking**: Antwortzeiten und Erfolgsrate automatisch erfasst
-- **Fehler-Kategorisierung**: Timeout, JSON, Connection, API aufgeschluesselt
-- **Konfigurierbares Log-Level**: DEBUG/INFO/WARNING/ERROR via `.env`
-- **Organisationsgrad im Header**: Fortschritt direkt im Hauptmenue sichtbar
-
-### Statistiken
-- **Organisationsgrad**: Vollstaendigkeit aller Dokumente
-- **Tag-Kombinationen**: Top-10 haeufigste Tag-Paare
-- **Dokumenttyp-Verteilung**: Anteil jedes Typs mit Prozenten
-- **Speicherpfad-Analyse**: Nutzung und leere Pfade auf einen Blick
-- **Korrespondenten-Aktivitaet**: Aktiv (30/90 Tage) vs. dormant
-- **Stale-Erkennung**: Dokumente >30 Tage unorganisiert
-- **Verarbeitungsstatistik**: Erfolgsrate, Fehler, Review-Quote (letzte 30 Tage)
-- **Konfidenz-Kalibrierung**: Genauigkeit pro Konfidenz-Level
-
-### Review-Queue
-- **Batch-Verarbeitung**: Alle offenen Reviews auf einmal pruefen + lernen
-- **Alters-Tracking**: Farbcodierung nach Alter (gruen <7d, gelb 7-30d, rot >30d)
-- **Dokument-Vorschau**: Inhalt und LLM-Vorschlag direkt in der Review-Queue ansehen
-- **Auto-Resolve**: Periodisches Pruefen ob Reviews inzwischen manuell erledigt wurden
-- **Duplikat-Schutz**: Kuerzlich geschlossene Reviews werden nicht erneut geoeffnet (24h Cooldown)
 
 ## Voraussetzungen
 
@@ -91,24 +71,56 @@ cp .env.example .env
 ## Start
 
 ```bash
-python paperless_organizer.py
+# Als Package (empfohlen)
+python -m paperless_organizer
+
+# Oder via run.py
+python run.py
+```
+
+## Projektstruktur
+
+```
+paperless_organizer/          # Python-Package
+    __init__.py               # Package-Init, exportiert __version__
+    __main__.py               # Entry-Point fuer python -m
+    app.py                    # TUI-Menuesystem, Live-Watch, Autopilot
+    config.py                 # Konfiguration aus .env + Logging
+    constants.py              # Statische Daten (Hints, BLZ, Guardrails)
+    models.py                 # Datenklassen (DecisionContext)
+    client.py                 # Paperless-NGX REST-API Client
+    db.py                     # SQLite State-DB (Runs, Reviews, Stats)
+    llm.py                    # LLM-Analyzer (Ollama/LM Studio)
+    learning.py               # Lernprofil + Few-Shot-Beispiele
+    processing.py             # Dokumentverarbeitung + Batch + Auto-Organize
+    guardrails.py             # Guardrails, Tag-Selektion, Review-Logik
+    cleanup.py                # Tag/Korrespondent/Typ-Bereinigung
+    duplicates.py             # Duplikat-Erkennung
+    review.py                 # Review-Queue + Auto-Resolve
+    statistics.py             # Statistiken + Reports
+    taxonomy.py               # Tag-Taxonomie
+    utils.py                  # Hilfsfunktionen
+    web_hints.py              # Web-Suche fuer Entity-Erkennung
+    exceptions.py             # Custom Exceptions
+run.py                        # Convenience Entry-Point
+.env.example                  # Konfigurationsvorlage
+taxonomy_tags.json            # Erlaubte Tags inkl. Synonyme und Farben
+requirements.txt              # Python-Abhaengigkeiten
+test_dokumente/               # Test-PDFs + Generator
 ```
 
 ## Wichtige Dateien
 
 | Datei | Beschreibung |
 |-------|-------------|
-| `paperless_organizer.py` | Hauptanwendung (~7250 Zeilen) |
+| `paperless_organizer/` | Hauptanwendung (Python-Package, 17 Module) |
 | `.env` | Konfiguration (nicht committen!) |
 | `.env.example` | Konfigurationsvorlage mit Dokumentation |
 | `taxonomy_tags.json` | Erlaubte Tags inkl. Synonyme und Farben |
-| `organizer_state.db` | SQLite-DB mit Run-Historie + Konfidenz-Kalibrierung (automatisch erstellt) |
+| `organizer_state.db` | SQLite-DB mit Run-Historie (automatisch erstellt) |
 | `learning_profile.json` | Lernprofil: Beschaeftigungsverlauf, Fahrzeuge, Hinweise |
 | `learning_examples.jsonl` | Bestaetigte Few-Shot-Beispiele (inkl. Anti-Patterns) |
 | `organizer.log` | Laufendes Text-Log (rotiert bei 5MB) |
-| `backups/` | Learning-Daten Backups |
-| `legacy/` | Alte Einzelskripte (nur als Referenz) |
-| `test_dokumente/` | Test-PDFs + Generator fuer Entwicklung |
 
 ## Empfohlene Konfiguration
 
