@@ -10,6 +10,7 @@ venv/
 
 # Runtime state (regenerated on use)
 organizer.log
+organizer.jsonl
 organizer_state.db
 cleanup_log.txt
 duplikate_bericht.txt
@@ -18,6 +19,12 @@ duplikate_bericht.txt
 learning_examples.jsonl
 learning_profile.json
 backups/
+
+# Legacy monolith (kept locally, not in repo)
+paperless_organizer_legacy.py
+
+# CSV exports
+processing_export_*.csv
 
 # IDE
 .idea/
