@@ -114,6 +114,13 @@ LLM_VERIFY_ON_LOW_CONFIDENCE = os.getenv("LLM_VERIFY_ON_LOW_CONFIDENCE", "0").st
 LLM_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "").strip()
 LLM_FALLBACK_AFTER_ERRORS = int(os.getenv("LLM_FALLBACK_AFTER_ERRORS", "3"))
 
+# --- LLM Speedcheck ---
+LLM_SPEEDCHECK_ENABLED = os.getenv("LLM_SPEEDCHECK_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+LLM_SPEEDCHECK_MAX_TIME = float(os.getenv("LLM_SPEEDCHECK_MAX_TIME", "10.0"))
+LLM_SPEEDCHECK_TIMEOUT = int(os.getenv("LLM_SPEEDCHECK_TIMEOUT", "15"))
+LLM_SPEEDCHECK_AUTO_SWITCH = os.getenv("LLM_SPEEDCHECK_AUTO_SWITCH", "1").strip().lower() in ("1", "true", "yes", "on")
+LLM_SPEEDCHECK_INTERVAL_CYCLES = int(os.getenv("LLM_SPEEDCHECK_INTERVAL_CYCLES", "0"))
+
 # --- Paperless-NGX ---
 OWNER_ID = int(os.getenv("OWNER_ID", "4"))
 ORGANIZER_OWNER_NAME = os.getenv("ORGANIZER_OWNER_NAME", "Document Owner").strip()

@@ -41,6 +41,11 @@ from .config import (
     LIVE_WATCH_INTERVAL_SEC,
     LLM_KEEP_ALIVE,
     LLM_MODEL,
+    LLM_SPEEDCHECK_AUTO_SWITCH,
+    LLM_SPEEDCHECK_ENABLED,
+    LLM_SPEEDCHECK_INTERVAL_CYCLES,
+    LLM_SPEEDCHECK_MAX_TIME,
+    LLM_SPEEDCHECK_TIMEOUT,
     LLM_URL,
     LOG_DIR,
     LOG_FILE,
@@ -73,7 +78,7 @@ from .guardrails import (
 )
 from .learning import LearningExamples, LearningProfile
 from .llm import LocalLLMAnalyzer
-from .models import DecisionContext
+from .models import DecisionContext, ProcessingContext
 from .processing import (
     auto_organize_all,
     batch_process,
@@ -165,6 +170,73 @@ class App:
             self.llm_model = self.analyzer.model
         return ok
 
+    def _run_speedcheck(self, auto_switch: bool = True) -> dict | None:
+        """Fuehrt LLM-Speedcheck durch und wechselt ggf. auf schnellstes Modell.
+
+        Returns benchmark result dict or None on error.
+        """
+        if not self.analyzer:
+            return None
+
+        log.info("LLM-Speedcheck: Teste aktuelles Modell...")
+        check = self.analyzer.speedcheck(timeout=LLM_SPEEDCHECK_TIMEOUT)
+
+        if check["ok"] and check["response_time"] <= LLM_SPEEDCHECK_MAX_TIME:
+            log.info(
+                "[green]LLM-Speedcheck OK[/green]: %s in %.1fs (Limit: %.1fs)",
+                check["model"], check["response_time"], LLM_SPEEDCHECK_MAX_TIME,
+            )
+            return {"results": [check], "best_model": check["model"],
+                    "best_time": check["response_time"],
+                    "current_model": check["model"], "current_ok": True,
+                    "current_time": check["response_time"],
+                    "max_acceptable_time": LLM_SPEEDCHECK_MAX_TIME,
+                    "switched": False}
+
+        # Current model too slow or failed -> benchmark all
+        if check["ok"]:
+            log.warning(
+                "[yellow]LLM-Speedcheck[/yellow]: %s zu langsam (%.1fs > %.1fs) - benchmarke alle Modelle...",
+                check["model"], check["response_time"], LLM_SPEEDCHECK_MAX_TIME,
+            )
+        else:
+            log.warning(
+                "[yellow]LLM-Speedcheck[/yellow]: %s fehlgeschlagen (%s) - benchmarke alle Modelle...",
+                check["model"], check["error"],
+            )
+
+        benchmark = self.analyzer.benchmark_available_models(
+            max_acceptable_time=LLM_SPEEDCHECK_MAX_TIME,
+            timeout_per_model=LLM_SPEEDCHECK_TIMEOUT,
+        )
+        benchmark["switched"] = False
+
+        best = benchmark["best_model"]
+        best_time = benchmark["best_time"]
+        ok_results = [r for r in benchmark["results"] if r["ok"]]
+
+        if not ok_results:
+            log.warning("[yellow]LLM-Speedcheck[/yellow]: Kein Modell erreichbar - fahre trotzdem fort")
+            return benchmark
+
+        if best != self.analyzer.model and auto_switch and LLM_SPEEDCHECK_AUTO_SWITCH:
+            log.warning(
+                "[yellow]LLM-Speedcheck: Wechsle Modell[/yellow] %s (%.1fs) -> %s (%.1fs)",
+                self.analyzer.model or "(default)", benchmark.get("current_time", 0),
+                best, best_time,
+            )
+            self.analyzer.model = best
+            self.analyzer._original_model = best
+            self.llm_model = best
+            benchmark["switched"] = True
+        elif best_time > LLM_SPEEDCHECK_MAX_TIME:
+            log.warning(
+                "[yellow]LLM-Speedcheck[/yellow]: Bestes Modell %s immer noch langsam (%.1fs) - fahre trotzdem fort",
+                best, best_time,
+            )
+
+        return benchmark
+
     def _load_master_data(self):
         """Stammdaten laden."""
         with console.status("Lade Stammdaten..."):
@@ -219,6 +291,25 @@ class App:
             log.info("Taxonomie-Bootstrap: %s Tags erstellt", created)
         if skipped_limit:
             log.warning("Taxonomie-Bootstrap: %s Tags wegen Limit (%s) nicht erstellt", skipped_limit, MAX_TOTAL_TAGS)
+
+    def _build_ctx(self, tags: list, correspondents: list, doc_types: list,
+                   storage_paths: list, decision_context: DecisionContext | None = None,
+                   run_id: int | None = None) -> ProcessingContext:
+        """Build a ProcessingContext from current App state + master data."""
+        return ProcessingContext(
+            paperless=self.paperless,
+            analyzer=self.analyzer,
+            tags=tags,
+            correspondents=correspondents,
+            doc_types=doc_types,
+            storage_paths=storage_paths,
+            taxonomy=self.taxonomy,
+            decision_context=decision_context,
+            learning_profile=self.learning_profile,
+            learning_examples=self.learning_examples,
+            run_db=self.run_db,
+            run_id=run_id,
+        )
 
     def _collect_decision_context(self, correspondents: list, storage_paths: list) -> DecisionContext:
         """Phase 1: Daten sammeln, danach Entscheidungen treffen."""
@@ -371,22 +462,9 @@ class App:
                 console.print("[red]Ungueltige ID.[/red]")
                 return
             run_id = self._start_run("organize_single")
-            ok = process_document(
-                doc_id,
-                self.paperless,
-                self.analyzer,
-                tags,
-                correspondents,
-                doc_types,
-                storage_paths,
-                self.dry_run,
-                taxonomy=self.taxonomy,
-                decision_context=decision_context,
-                learning_profile=self.learning_profile,
-                learning_examples=self.learning_examples,
-                run_db=self.run_db,
-                run_id=run_id,
-            )
+            ctx = self._build_ctx(tags, correspondents, doc_types, storage_paths,
+                                  decision_context=decision_context, run_id=run_id)
+            ok = process_document(doc_id, ctx, self.dry_run)
             self._finish_run(run_id, {"mode": "single", "doc_id": doc_id, "updated": int(ok)})
 
         elif choice in ("2", "3", "4"):
@@ -397,23 +475,10 @@ class App:
                 limit = 0
             mode_map = {"2": "untagged", "3": "unorganized", "4": "all"}
             run_id = self._start_run(f"batch_{mode_map[choice]}")
-            summary = batch_process(
-                self.paperless,
-                self.analyzer,
-                tags,
-                correspondents,
-                doc_types,
-                storage_paths,
-                self.dry_run,
-                mode=mode_map[choice],
-                limit=limit,
-                taxonomy=self.taxonomy,
-                decision_context=decision_context,
-                learning_profile=self.learning_profile,
-                learning_examples=self.learning_examples,
-                run_db=self.run_db,
-                run_id=run_id,
-            )
+            ctx = self._build_ctx(tags, correspondents, doc_types, storage_paths,
+                                  decision_context=decision_context, run_id=run_id)
+            summary = batch_process(ctx, self.dry_run,
+                                    mode=mode_map[choice], limit=limit)
             self._finish_run(run_id, summary)
 
     def action_auto_organize(self):
@@ -433,22 +498,10 @@ class App:
         decision_context = self._collect_decision_context(correspondents, storage_paths)
         action_name = "auto_organize_recheck_all" if force_recheck_all else "auto_organize"
         run_id = self._start_run(action_name)
-        summary = auto_organize_all(
-            self.paperless,
-            self.analyzer,
-            tags,
-            correspondents,
-            doc_types,
-            storage_paths,
-            self.dry_run,
-            force_recheck_all=force_recheck_all,
-            taxonomy=self.taxonomy,
-            decision_context=decision_context,
-            learning_profile=self.learning_profile,
-            learning_examples=self.learning_examples,
-            run_db=self.run_db,
-            run_id=run_id,
-        )
+        ctx = self._build_ctx(tags, correspondents, doc_types, storage_paths,
+                              decision_context=decision_context, run_id=run_id)
+        summary = auto_organize_all(ctx, self.dry_run,
+                                    force_recheck_all=force_recheck_all)
         self._finish_run(run_id, summary)
 
     def action_live_watch(self):
@@ -560,6 +613,8 @@ class App:
                     time.sleep(min(interval_sec, 15))
                     continue
 
+                ctx = self._build_ctx(tags, correspondents, doc_types, storage_paths,
+                                      decision_context=decision_context, run_id=run_id)
                 duplikat_tag_id = next((t["id"] for t in tags if t["name"] == "Duplikat"), None)
                 for doc_id in new_ids:
                     doc = docs_by_id.get(doc_id, {})
@@ -573,22 +628,9 @@ class App:
                     total_candidates += 1
                     try:
                         if process_document(
-                            doc_id,
-                            self.paperless,
-                            self.analyzer,
-                            tags,
-                            correspondents,
-                            doc_types,
-                            storage_paths,
-                            self.dry_run,
+                            doc_id, ctx, self.dry_run,
                             batch_mode=not self.dry_run,
                             prefer_compact=LIVE_WATCH_COMPACT_FIRST,
-                            taxonomy=self.taxonomy,
-                            decision_context=decision_context,
-                            learning_profile=self.learning_profile,
-                            learning_examples=self.learning_examples,
-                            run_db=self.run_db,
-                            run_id=run_id,
                         ):
                             total_updated += 1
                         else:
@@ -836,6 +878,7 @@ class App:
             ("Paperless-Verbindung", "pending"),
             ("Dokumente laden", "pending"),
             ("LLM-Verbindung", "pending"),
+            ("LLM-Speedcheck", "pending"),
             ("Stammdaten laden", "pending"),
             ("Entscheidungskontext", "pending"),
             ("Initiale Sortierung", "pending"),
@@ -979,6 +1022,23 @@ class App:
                     log.info("AUTOPILOT: LLM bereit")
                     _finish_init_step(2)
 
+                # -- Step 3: LLM-Speedcheck --
+                if llm_ok and LLM_SPEEDCHECK_ENABLED:
+                    _set_init(3, "active")
+                    init_steps[3] = ("LLM-Speedcheck laeuft...", "active")
+                    _refresh()
+                    sc_result = self._run_speedcheck(auto_switch=True)
+                    if sc_result and sc_result.get("switched"):
+                        init_steps[3] = (f"LLM-Speedcheck (gewechselt: {self.llm_model})", "active")
+                    elif sc_result:
+                        best_t = sc_result.get("best_time", 0)
+                        init_steps[3] = (f"LLM-Speedcheck ({best_t:.1f}s)", "active")
+                    _finish_init_step(3)
+                else:
+                    reason = "deaktiviert" if not LLM_SPEEDCHECK_ENABLED else "LLM nicht verfuegbar"
+                    init_steps[3] = (f"LLM-Speedcheck ({reason})", "active")
+                    _finish_init_step(3, min_duration=0.3)
+
                 # Start run tracking
                 run_id = self._start_run("autopilot")
 
@@ -992,25 +1052,27 @@ class App:
 
                 # -- Initial auto-organize (inline, with dashboard) --
                 if AUTOPILOT_START_WITH_AUTO_ORGANIZE:
-                    # Step 3: Master data
-                    _set_init(3, "active")
+                    # Step 4: Master data
+                    _set_init(4, "active")
                     _refresh()
                     try:
                         tags, correspondents, doc_types, storage_paths = self._load_master_data()
                         self._ensure_taxonomy_tags(tags)
-                        init_steps[3] = (
+                        init_steps[4] = (
                             f"Stammdaten ({len(tags)} Tags, {len(correspondents)} Korr.)", "active"
                         )
-                        _finish_init_step(3)
-
-                        # Step 4: Decision context
-                        _set_init(4, "active")
-                        _refresh()
-                        decision_context = self._collect_decision_context(correspondents, storage_paths)
                         _finish_init_step(4)
 
-                        # Step 5: Scan & sort
+                        # Step 5: Decision context
                         _set_init(5, "active")
+                        _refresh()
+                        decision_context = self._collect_decision_context(correspondents, storage_paths)
+                        ctx = self._build_ctx(tags, correspondents, doc_types, storage_paths,
+                                              decision_context=decision_context, run_id=run_id)
+                        _finish_init_step(5)
+
+                        # Step 6: Scan & sort
+                        _set_init(6, "active")
                         _refresh()
                         all_docs = self.paperless.get_documents()
                         total_docs = len(all_docs)
@@ -1026,7 +1088,7 @@ class App:
                         todo.sort(key=lambda d: d.get("added", d.get("created", "")), reverse=True)
 
                         if todo:
-                            init_steps[5] = (f"Initiale Sortierung ({len(todo)} Dok.)", "active")
+                            init_steps[6] = (f"Initiale Sortierung ({len(todo)} Dok.)", "active")
                             phase = "Sortierung"
                             log.info(f"AUTOPILOT: Initiale Sortierung - {len(todo)} Dokumente")
                             current_step = f"Initiale Sortierung: 0/{len(todo)}"
@@ -1045,22 +1107,9 @@ class App:
                                 is_timeout = False
                                 try:
                                     if process_document(
-                                        doc["id"],
-                                        self.paperless,
-                                        self.analyzer,
-                                        tags,
-                                        correspondents,
-                                        doc_types,
-                                        storage_paths,
-                                        self.dry_run,
+                                        doc["id"], ctx, self.dry_run,
                                         batch_mode=not self.dry_run,
                                         prefer_compact=LIVE_WATCH_COMPACT_FIRST,
-                                        taxonomy=self.taxonomy,
-                                        decision_context=decision_context,
-                                        learning_profile=self.learning_profile,
-                                        learning_examples=self.learning_examples,
-                                        run_db=self.run_db,
-                                        run_id=run_id,
                                         status_callback=_status_cb_with_refresh,
                                         quiet=True,
                                     ):
@@ -1109,10 +1158,10 @@ class App:
                                     recent_results = recent_results[-20:]
                                 _refresh()
 
-                            init_steps[5] = (f"Initiale Sortierung ({total_updated} aktualisiert)", "done")
+                            init_steps[6] = (f"Initiale Sortierung ({total_updated} aktualisiert)", "done")
                             log.info(f"AUTOPILOT: Initiale Sortierung fertig - {total_updated} aktualisiert")
                         else:
-                            init_steps[5] = ("Initiale Sortierung (alles sortiert)", "done")
+                            init_steps[6] = ("Initiale Sortierung (alles sortiert)", "done")
                             log.info("AUTOPILOT: Alle Dokumente bereits sortiert")
 
                         # Refresh known IDs after initial organize
@@ -1125,11 +1174,11 @@ class App:
                             log.warning(f"AUTOPILOT: Re-Load nach Initialsortierung fehlgeschlagen: {exc}")
                     except Exception as exc:
                         total_poll_errors += 1
-                        _set_init(3, "error")
+                        _set_init(4, "error")
                         log.error(f"AUTOPILOT: Initiale Sortierung fehlgeschlagen: {exc}")
                 else:
-                    # Skip init steps 3-5 when auto-organize is off
-                    for idx in (3, 4, 5):
+                    # Skip init steps 4-6 when auto-organize is off
+                    for idx in (4, 5, 6):
                         init_steps[idx] = (init_steps[idx][0] + " (uebersprungen)", "active")
                         _finish_init_step(idx, min_duration=0.3)
 
@@ -1268,6 +1317,8 @@ class App:
                             self._ensure_taxonomy_tags(tags)
                             if decision_context is None or (cycle % refresh_cycles == 0):
                                 decision_context = self._collect_decision_context(correspondents, storage_paths)
+                            ctx = self._build_ctx(tags, correspondents, doc_types, storage_paths,
+                                                  decision_context=decision_context, run_id=run_id)
                         except Exception as exc:
                             total_poll_errors += 1
                             log.error(f"AUTOPILOT Stammdaten/Kontext-Fehler: {exc}")
@@ -1296,22 +1347,9 @@ class App:
                             is_timeout = False
                             try:
                                 if process_document(
-                                    doc_id,
-                                    self.paperless,
-                                    self.analyzer,
-                                    tags,
-                                    correspondents,
-                                    doc_types,
-                                    storage_paths,
-                                    self.dry_run,
+                                    doc_id, ctx, self.dry_run,
                                     batch_mode=not self.dry_run,
                                     prefer_compact=LIVE_WATCH_COMPACT_FIRST,
-                                    taxonomy=self.taxonomy,
-                                    decision_context=decision_context,
-                                    learning_profile=self.learning_profile,
-                                    learning_examples=self.learning_examples,
-                                    run_db=self.run_db,
-                                    run_id=run_id,
                                     status_callback=_status_cb_with_refresh,
                                     quiet=True,
                                 ):
@@ -1368,6 +1406,18 @@ class App:
                         current_step = f"Keine neuen Dokumente, warte {interval_sec}s..."
                         _refresh()
                         log.info(f"AUTOPILOT: keine neuen Dokumente, warte {interval_sec}s...")
+
+                    # -- Periodic speedcheck --
+                    speedcheck_every = LLM_SPEEDCHECK_INTERVAL_CYCLES
+                    if speedcheck_every > 0 and cycle % speedcheck_every == 0 and llm_ok:
+                        try:
+                            current_step = "Periodischer LLM-Speedcheck..."
+                            _refresh()
+                            sc_result = self._run_speedcheck(auto_switch=True)
+                            if sc_result and sc_result.get("switched"):
+                                log.info(f"AUTOPILOT: Speedcheck - Modell gewechselt auf {self.llm_model}")
+                        except Exception as exc:
+                            log.warning(f"AUTOPILOT: Periodischer Speedcheck fehlgeschlagen: {exc}")
 
                     # -- Periodic maintenance --
                     if cleanup_every > 0 and cycle % cleanup_every == 0:
@@ -1523,6 +1573,7 @@ class App:
             ("12", "Datenbank bereinigen (alte Runs loeschen)"),
             ("13", "Verarbeitungshistorie exportieren (CSV)"),
             ("14", "Learning-Daten Integritaetspruefung"),
+            ("15", "LLM-Speedcheck (alle Modelle benchmarken)"),
             ("0", "Zurueck"),
         ])
 
@@ -1548,7 +1599,12 @@ class App:
             console.print(f"[green]URL geaendert: {self.llm_url}[/green]")
 
         elif choice == "4":
-            self._init_analyzer()
+            if self._init_analyzer():
+                check = self.analyzer.speedcheck()
+                if check["ok"]:
+                    console.print(f"  [green]Speedcheck:[/green] {check['response_time']:.1f}s ({check['model']})")
+                else:
+                    console.print(f"  [yellow]Speedcheck fehlgeschlagen:[/yellow] {check['error']}")
 
         elif choice == "5":
             _cfg.ALLOW_NEW_TAGS = not _cfg.ALLOW_NEW_TAGS
@@ -1655,6 +1711,43 @@ class App:
                     console.print(f"  [yellow]Problem:[/yellow] {issue}")
             else:
                 console.print("[green]Keine Probleme gefunden.[/green]")
+
+        elif choice == "15":
+            if not self._init_analyzer():
+                return
+            console.print("[cyan]Benchmarke alle verfuegbaren Modelle...[/cyan]")
+            benchmark = self.analyzer.benchmark_available_models(
+                max_acceptable_time=LLM_SPEEDCHECK_MAX_TIME,
+                timeout_per_model=LLM_SPEEDCHECK_TIMEOUT,
+            )
+            table = Table(title="LLM-Speedcheck Ergebnisse", show_header=True)
+            table.add_column("Modell", style="cyan")
+            table.add_column("Zeit", justify="right")
+            table.add_column("Status")
+            table.add_column("", width=3)
+            for r in sorted(benchmark["results"], key=lambda x: x["response_time"] if x["ok"] else 999):
+                if r["ok"]:
+                    time_str = f"{r['response_time']:.1f}s"
+                    if r["response_time"] <= LLM_SPEEDCHECK_MAX_TIME:
+                        status = "[green]OK[/green]"
+                    else:
+                        status = "[yellow]Langsam[/yellow]"
+                else:
+                    time_str = "-"
+                    status = f"[red]{r['error']}[/red]"
+                marker = "[bold]*[/bold]" if r.get("is_current") else ""
+                table.add_row(r["model"], time_str, status, marker)
+            console.print(table)
+            console.print(f"[dim]* = aktuelles Modell | Limit: {LLM_SPEEDCHECK_MAX_TIME}s[/dim]")
+
+            best = benchmark["best_model"]
+            best_time = benchmark["best_time"]
+            if best and best != self.analyzer.model:
+                if Confirm.ask(f"Auf schnellstes Modell wechseln ({best}, {best_time:.1f}s)?", default=True):
+                    self.analyzer.model = best
+                    self.analyzer._original_model = best
+                    self.llm_model = best
+                    console.print(f"[green]Modell gewechselt: {best}[/green]")
 
     def action_find_duplicates(self):
         """Duplikate finden."""

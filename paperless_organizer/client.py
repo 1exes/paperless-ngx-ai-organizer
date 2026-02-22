@@ -25,7 +25,7 @@ class PaperlessClient:
     _MIN_WRITE_INTERVAL = 0.15
 
     def __init__(self, url: str, token: str):
-        self.url = url.rstrip("/")
+        self.url = url.rstrip("/").replace("http://", "https://")
         self.token = token
         self._color_index = 0
         self._cache: dict[str, tuple[float, list]] = {}
@@ -67,7 +67,6 @@ class PaperlessClient:
         page_num = 0
         url = f"{self.url}/api/{endpoint}/?page_size=100"
         while url:
-            url = url.replace("http://", "https://")
             last_exc = None
             resp = None
             for attempt in range(MAX_RETRIES):
@@ -113,8 +112,19 @@ class PaperlessClient:
     def get_storage_paths(self) -> list:
         return self._get_cached("storage_paths")
 
-    def get_documents(self) -> list:
-        return self._get_all("documents")
+    _DOCUMENTS_CACHE_TTL_SEC = 45
+
+    def get_documents(self, bypass_cache: bool = False) -> list:
+        if bypass_cache:
+            self._cache.pop("documents", None)
+            return self._get_all("documents")
+        now = time.monotonic()
+        cached = self._cache.get("documents")
+        if cached and (now - cached[0]) < self._DOCUMENTS_CACHE_TTL_SEC:
+            return cached[1]
+        result = self._get_all("documents")
+        self._cache["documents"] = (now, result)
+        return result
 
     def get_document(self, doc_id: int) -> dict:
         url = f"{self.url}/api/documents/{doc_id}/"

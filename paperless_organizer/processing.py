@@ -40,7 +40,7 @@ from .config import (
     log,
 )
 from .constants import ALLOWED_DOC_TYPES
-from .models import DecisionContext
+from .models import DecisionContext, ProcessingContext
 from .db import LocalStateDB
 from .client import PaperlessClient
 from .taxonomy import TagTaxonomy
@@ -78,15 +78,18 @@ from .web_hints import _web_search_document_context
 # ID resolution & display
 # ---------------------------------------------------------------------------
 
-def resolve_ids(paperless: PaperlessClient, suggestion: dict,
-                tags: list, correspondents: list,
-                doc_types: list, storage_paths: list,
-                taxonomy: TagTaxonomy | None = None,
-                run_db: LocalStateDB | None = None,
-                run_id: int | None = None,
+def resolve_ids(ctx: ProcessingContext, suggestion: dict,
                 doc_id: int | None = None,
                 quiet: bool = False) -> dict:
     """Wandelt Namen in IDs um, erstellt fehlende Eintraege."""
+    paperless = ctx.paperless
+    tags = ctx.tags
+    correspondents = ctx.correspondents
+    doc_types = ctx.doc_types
+    storage_paths = ctx.storage_paths
+    taxonomy = ctx.taxonomy
+    run_db = ctx.run_db
+    run_id = ctx.run_id
 
     # Tags
     tag_map = {t["name"].lower(): t["id"] for t in tags}
@@ -329,21 +332,25 @@ def show_suggestion(document: dict, suggestion: dict, asn: int | None,
 # Document processing
 # ---------------------------------------------------------------------------
 
-def process_document(doc_id: int, paperless: PaperlessClient,
-                     analyzer: LocalLLMAnalyzer, tags: list,
-                     correspondents: list, doc_types: list,
-                     storage_paths: list, dry_run: bool = True,
+def process_document(doc_id: int, ctx: ProcessingContext,
+                     dry_run: bool = True,
                      batch_mode: bool = False,
                      prefer_compact: bool = False,
-                     taxonomy: TagTaxonomy | None = None,
-                     decision_context: DecisionContext | None = None,
-                     learning_profile: LearningProfile | None = None,
-                     learning_examples: LearningExamples | None = None,
-                     run_db: LocalStateDB | None = None,
-                     run_id: int | None = None,
                      status_callback: Callable[[str], None] | None = None,
                      quiet: bool = False) -> bool:
     """Einzelnes Dokument analysieren und organisieren."""
+    paperless = ctx.paperless
+    analyzer = ctx.analyzer
+    tags = ctx.tags
+    correspondents = ctx.correspondents
+    doc_types = ctx.doc_types
+    storage_paths = ctx.storage_paths
+    taxonomy = ctx.taxonomy
+    decision_context = ctx.decision_context
+    learning_profile = ctx.learning_profile
+    learning_examples = ctx.learning_examples
+    run_db = ctx.run_db
+    run_id = ctx.run_id
     t_total_start = time.perf_counter()
     _cb = status_callback or (lambda _msg: None)
 
@@ -711,15 +718,8 @@ def process_document(doc_id: int, paperless: PaperlessClient,
     try:
         with WRITE_LOCK:
             update_data = resolve_ids(
-                paperless,
+                ctx,
                 suggestion,
-                tags,
-                correspondents,
-                doc_types,
-                storage_paths,
-                taxonomy=taxonomy,
-                run_db=run_db,
-                run_id=run_id,
                 doc_id=doc_id,
                 quiet=quiet,
             )
@@ -762,20 +762,16 @@ def process_document(doc_id: int, paperless: PaperlessClient,
 # Auto-organize & batch
 # ---------------------------------------------------------------------------
 
-def auto_organize_all(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
-                      tags: list, correspondents: list, doc_types: list,
-                      storage_paths: list, dry_run: bool,
+def auto_organize_all(ctx: ProcessingContext, dry_run: bool,
                       force_recheck_all: bool = False,
-                      prefer_compact: bool = False,
-                      taxonomy: TagTaxonomy | None = None,
-                      decision_context: DecisionContext | None = None,
-                      learning_profile: LearningProfile | None = None,
-                      learning_examples: LearningExamples | None = None,
-                      run_db: LocalStateDB | None = None,
-                      run_id: int | None = None):
+                      prefer_compact: bool = False):
     """Scannt ALLE Dokumente, ueberspringt bereits sortierte, organisiert den Rest."""
 
     log.info("[bold]AUTO-SORTIERUNG[/bold] gestartet - scanne alle Dokumente...")
+
+    paperless = ctx.paperless
+    tags = ctx.tags
+    run_db = ctx.run_db
 
     documents = paperless.get_documents()
     total = len(documents)
@@ -878,14 +874,9 @@ def auto_organize_all(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
                 log.info(f"[bold]--- {i}/{len(todo)} --- Dokument #{doc['id']}[/bold]")
                 doc_t0 = time.perf_counter()
                 try:
-                    if process_document(doc["id"], paperless, analyzer, tags, correspondents,
-                                        doc_types, storage_paths, dry_run, batch_mode=not dry_run,
-                                        prefer_compact=prefer_compact,
-                                        taxonomy=taxonomy,
-                                        decision_context=decision_context,
-                                        learning_profile=learning_profile,
-                                        learning_examples=learning_examples,
-                                        run_db=run_db, run_id=run_id):
+                    if process_document(doc["id"], ctx, dry_run,
+                                        batch_mode=not dry_run,
+                                        prefer_compact=prefer_compact):
                         applied += 1
                 except Exception as e:
                     errors += 1
@@ -912,21 +903,10 @@ def auto_organize_all(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
                 pool.submit(
                     process_document,
                     doc["id"],
-                    paperless,
-                    analyzer,
-                    tags,
-                    correspondents,
-                    doc_types,
-                    storage_paths,
+                    ctx.copy_master_data(),
                     dry_run,
                     True,
                     prefer_compact,
-                    taxonomy,
-                    decision_context,
-                    learning_profile,
-                    learning_examples,
-                    run_db,
-                    run_id,
                 ): doc["id"]
                 for doc in todo
             }
@@ -966,17 +946,13 @@ def auto_organize_all(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
             "elapsed_sec": round(batch_elapsed, 1), "avg_sec_per_doc": round(avg_time, 1)}
 
 
-def batch_process(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
-                  tags: list, correspondents: list, doc_types: list,
-                  storage_paths: list, dry_run: bool, mode: str = "untagged",
-                  limit: int = 0,
-                  taxonomy: TagTaxonomy | None = None,
-                  decision_context: DecisionContext | None = None,
-                  learning_profile: LearningProfile | None = None,
-                  learning_examples: LearningExamples | None = None,
-                  run_db: LocalStateDB | None = None,
-                  run_id: int | None = None):
+def batch_process(ctx: ProcessingContext, dry_run: bool,
+                  mode: str = "untagged", limit: int = 0):
     """Mehrere Dokumente mit Filter verarbeiten."""
+
+    paperless = ctx.paperless
+    tags = ctx.tags
+    run_db = ctx.run_db
 
     mode_labels = {"untagged": "Ohne Tags", "unorganized": "Unvollstaendig", "all": "Alle"}
     log.info(f"[bold]BATCH START[/bold] - Filter: {mode_labels.get(mode, mode)}, Limit: {limit or 'alle'}")
@@ -1042,13 +1018,8 @@ def batch_process(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
         for i, doc in enumerate(documents, 1):
             log.info(f"[bold]--- {i}/{len(documents)} --- Dokument #{doc['id']}[/bold]")
             try:
-                if process_document(doc["id"], paperless, analyzer, tags, correspondents,
-                                    doc_types, storage_paths, dry_run, batch_mode=not dry_run,
-                                    taxonomy=taxonomy,
-                                    decision_context=decision_context,
-                                    learning_profile=learning_profile,
-                                    learning_examples=learning_examples,
-                                    run_db=run_db, run_id=run_id):
+                if process_document(doc["id"], ctx, dry_run,
+                                    batch_mode=not dry_run):
                     applied += 1
             except Exception as e:
                 errors += 1
@@ -1062,21 +1033,9 @@ def batch_process(paperless: PaperlessClient, analyzer: LocalLLMAnalyzer,
                 pool.submit(
                     process_document,
                     doc["id"],
-                    paperless,
-                    analyzer,
-                    tags,
-                    correspondents,
-                    doc_types,
-                    storage_paths,
+                    ctx.copy_master_data(),
                     dry_run,
                     True,
-                    False,
-                    taxonomy,
-                    decision_context,
-                    learning_profile,
-                    learning_examples,
-                    run_db,
-                    run_id,
                 ): doc["id"]
                 for doc in documents
             }

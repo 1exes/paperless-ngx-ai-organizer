@@ -26,6 +26,7 @@ from .config import (
     LLM_MAX_TOKENS,
     LLM_MODEL,
     LLM_RETRY_COUNT,
+    LLM_SPEEDCHECK_TIMEOUT,
     LLM_SYSTEM_PROMPT,
     LLM_TEMPERATURE,
     LLM_TIMEOUT,
@@ -130,14 +131,25 @@ class LocalLLMAnalyzer:
             candidates.append(self.url.replace("/api/chat", "/v1/models"))
         return list(dict.fromkeys(candidates))
 
-    def _discover_model(self, headers: dict | None) -> str:
-        preferred = [
-            "qwen2.5:14b", "qwen2.5:7b", "qwen3:8b",
-            "qwen2.5-coder:14b", "qwen2.5-coder:7b",
-            "gemma3:12b", "gemma3:4b",
-            "google/gemma-3-12b", "google/gemma-3-4b", "gemma3:latest",
-            "llama3.1:8b", "mistral:7b", "phi-4:14b", "llama3.2:3b",
-        ]
+    # Model name patterns that indicate non-chat models (embedding, TTS, vision-only, etc.)
+    _NON_CHAT_MODEL_PATTERNS = (
+        "embed", "embedding", "tts", "whisper", "rerank",
+        "text-embedding", "nomic-embed", "bge-", "e5-",
+    )
+
+    @classmethod
+    def _is_chat_model(cls, model_id: str) -> bool:
+        """Return True if model_id looks like a chat/completion model (not embedding/TTS/etc)."""
+        lower = model_id.lower()
+        return not any(pat in lower for pat in cls._NON_CHAT_MODEL_PATTERNS)
+
+    def discover_available_models(self, chat_only: bool = True) -> list[str]:
+        """Holt alle verfuegbaren Modelle vom Server (LM Studio + Ollama).
+
+        Args:
+            chat_only: If True, filters out embedding/TTS/non-chat models.
+        """
+        headers = self._auth_headers()
         discovered: list[str] = []
         for test_url in self._candidate_model_urls():
             try:
@@ -158,9 +170,22 @@ class LocalLLMAnalyzer:
                         discovered.append(model_id.strip())
             except (requests.exceptions.RequestException, ValueError):
                 continue
-        if not discovered:
-            return ""
         unique = list(dict.fromkeys(discovered))
+        if chat_only:
+            unique = [m for m in unique if self._is_chat_model(m)]
+        return unique
+
+    def _discover_model(self, headers: dict | None) -> str:
+        preferred = [
+            "qwen2.5:14b", "qwen2.5:7b", "qwen3:8b",
+            "qwen2.5-coder:14b", "qwen2.5-coder:7b",
+            "gemma3:12b", "gemma3:4b",
+            "google/gemma-3-12b", "google/gemma-3-4b", "gemma3:latest",
+            "llama3.1:8b", "mistral:7b", "phi-4:14b", "llama3.2:3b",
+        ]
+        unique = self.discover_available_models()
+        if not unique:
+            return ""
         lower_map = {m.lower(): m for m in unique}
         for pref in preferred:
             hit = lower_map.get(pref.lower())
@@ -203,6 +228,116 @@ class LocalLLMAnalyzer:
         log.error(f"LLM-Server nicht erreichbar! ({self.url})")
         console.print("[yellow]Bitte LLM-Server starten und Modell laden.[/yellow]")
         return False
+
+    def speedcheck(self, timeout: int | None = None) -> dict:
+        """Sendet Mini-Klassifikations-Prompt, misst Antwortzeit.
+
+        Returns dict with keys: ok, response_time, model, error
+        """
+        effective_timeout = timeout if timeout is not None else LLM_SPEEDCHECK_TIMEOUT
+        test_prompt = (
+            'Klassifiziere: "Rechnung Telekom Februar 2025"\n'
+            'Antwort NUR JSON: {"document_type": "...", "correspondent": "..."}'
+        )
+        headers = self._auth_headers()
+        payload = self._build_payload(test_prompt, max_tokens=60)
+        model_label = self.model or "(server-default)"
+        try:
+            t0 = time.perf_counter()
+            resp = requests.post(
+                self.url,
+                headers=headers,
+                json=payload,
+                timeout=(max(3, LLM_CONNECT_TIMEOUT), effective_timeout),
+            )
+            elapsed = time.perf_counter() - t0
+            if resp.ok:
+                # Validate response contains actual text (not embedding vectors)
+                try:
+                    text = self._extract_response_text(resp.json())
+                    if not text or len(text) < 3:
+                        return {
+                            "ok": False, "response_time": round(elapsed, 2), "model": model_label,
+                            "error": "Leere Antwort (kein Chat-Modell?)",
+                        }
+                except (ValueError, RuntimeError):
+                    return {
+                        "ok": False, "response_time": round(elapsed, 2), "model": model_label,
+                        "error": "Kein Text in Antwort (kein Chat-Modell?)",
+                    }
+                return {"ok": True, "response_time": round(elapsed, 2), "model": model_label, "error": None}
+            return {
+                "ok": False, "response_time": round(elapsed, 2), "model": model_label,
+                "error": f"HTTP {resp.status_code}",
+            }
+        except requests.exceptions.Timeout:
+            elapsed = time.perf_counter() - t0
+            return {
+                "ok": False, "response_time": round(elapsed, 2), "model": model_label,
+                "error": f"Timeout (>{effective_timeout}s)",
+            }
+        except requests.exceptions.RequestException as exc:
+            return {"ok": False, "response_time": 0.0, "model": model_label, "error": str(exc)}
+
+    def benchmark_available_models(
+        self,
+        max_acceptable_time: float = 10.0,
+        timeout_per_model: int | None = None,
+    ) -> dict:
+        """Benchmarkt aktuelles + alle anderen Modelle, empfiehlt schnellstes.
+
+        Returns dict with keys: results (list of dicts), best_model, best_time,
+        current_model, current_ok
+        """
+        effective_timeout = timeout_per_model if timeout_per_model is not None else LLM_SPEEDCHECK_TIMEOUT
+        available = self.discover_available_models()
+        current_model = self.model or ""
+
+        # Ensure current model is tested first
+        models_to_test = []
+        if current_model and current_model in available:
+            models_to_test.append(current_model)
+            models_to_test.extend(m for m in available if m != current_model)
+        elif current_model:
+            models_to_test.append(current_model)
+            models_to_test.extend(available)
+        else:
+            models_to_test = list(available)
+
+        results: list[dict] = []
+        original_model = self.model
+        try:
+            for model_name in models_to_test:
+                self.model = model_name
+                result = self.speedcheck(timeout=effective_timeout)
+                result["is_current"] = (model_name == current_model)
+                results.append(result)
+                log.info(
+                    "  Speedcheck %s: %s (%.1fs)",
+                    model_name,
+                    "OK" if result["ok"] else result["error"],
+                    result["response_time"],
+                )
+        finally:
+            self.model = original_model
+
+        # Find best model
+        ok_results = [r for r in results if r["ok"]]
+        if ok_results:
+            best = min(ok_results, key=lambda r: r["response_time"])
+        else:
+            best = {"model": current_model, "response_time": 0.0}
+
+        current_result = next((r for r in results if r.get("is_current")), None)
+        return {
+            "results": results,
+            "best_model": best["model"],
+            "best_time": best["response_time"],
+            "current_model": current_model or "(server-default)",
+            "current_ok": current_result["ok"] if current_result else False,
+            "current_time": current_result["response_time"] if current_result else 0.0,
+            "max_acceptable_time": max_acceptable_time,
+        }
 
     def _parse_json_response(self, text: str) -> dict:
         """JSON aus LLM-Antwort extrahieren."""

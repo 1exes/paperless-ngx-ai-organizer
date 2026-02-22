@@ -291,6 +291,12 @@ class LearningExamples:
         self._examples: list[dict] = []
         self.load()
 
+    def _rewrite_file(self):
+        """Full rewrite of the JSONL file (called only on compaction)."""
+        with open(self.path, "w", encoding="utf-8") as f:
+            for entry in self._examples:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
     def load(self):
         self._examples = []
         if not os.path.exists(self.path):
@@ -381,9 +387,10 @@ class LearningExamples:
             self._examples.append(row)
             if len(self._examples) > self.max_examples:
                 self._examples = self._examples[-self.max_examples:]
-            with open(self.path, "w", encoding="utf-8") as f:
-                for entry in self._examples:
-                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                self._rewrite_file()
+            else:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def get_rejected_patterns(self, correspondent: str, limit: int = 5) -> list[dict]:
         """Get recent rejected suggestions for a correspondent to avoid repeating mistakes."""
