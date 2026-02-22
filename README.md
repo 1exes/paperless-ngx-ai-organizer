@@ -10,7 +10,7 @@ Automatische Dokumentenorganisation mit lokalem LLM (Ollama/LM Studio).
 
 ## Features
 - Automatische Klassifizierung von Dokumenten per KI
-- Lokale Verarbeitung ohne Cloud-Abhaengigkeit
+- Lokale Verarbeitung ohne Cloud-Abhängigkeit
 - Integration mit Paperless-NGX API
 
 ## Getting Started
@@ -21,7 +21,7 @@ python main.py
 ```
 
 ## Status
-In aktiver Entwicklung
+🚀 In aktiver Entwicklung
 
 ## Lizenz
 MIT
