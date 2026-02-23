@@ -58,6 +58,7 @@ from .utils import (
     _sanitize_suggestion_spelling,
 )
 from .guardrails import (
+    _apply_knowledge_guardrails,
     _apply_learning_guardrails,
     _apply_topic_guardrails,
     _apply_update_with_fallbacks,
@@ -663,6 +664,16 @@ def process_document(doc_id: int, ctx: ProcessingContext,
     for fix in learning_fixes:
         log.info(f"  [cyan]Learning-Guardrail[/cyan]: {fix}")
 
+    knowledge_db = getattr(ctx, "knowledge_db", None)
+    knowledge_fixes = _apply_knowledge_guardrails(
+        document,
+        suggestion,
+        storage_paths,
+        knowledge_db=knowledge_db,
+    )
+    for fix in knowledge_fixes:
+        log.info(f"  [cyan]Knowledge-Guardrail[/cyan]: {fix}")
+
     _cb("Tags auswaehlen...")
     selected_tags, dropped_tags = _select_controlled_tags(
         suggestion.get("tags", []),
@@ -747,6 +758,14 @@ def process_document(doc_id: int, ctx: ProcessingContext,
                 learning_examples.append(document, suggestion)
             except Exception as ex_exc:
                 log.warning(f"  [yellow]Learning-Beispiele Update uebersprungen:[/yellow] {ex_exc}")
+        # Knowledge DB: extract and store facts from processed document
+        knowledge_db = getattr(ctx, "knowledge_db", None)
+        if knowledge_db and _cfg.KNOWLEDGE_DB_URL and getattr(_cfg, "ENABLE_KNOWLEDGE_EXTRACTION", False):
+            try:
+                owner = learning_profile.data.get("owner", "Document Owner") if learning_profile else "Document Owner"
+                knowledge_db.extract_and_store_facts(document, suggestion, ctx.analyzer, owner)
+            except Exception as kb_exc:
+                log.debug(f"  [dim]Knowledge-Extraktion uebersprungen:[/dim] {kb_exc}")
         return True
     except Exception as exc:
         reason_text = f"update-fehler: {exc}"

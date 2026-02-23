@@ -34,6 +34,7 @@ from .config import (
     AUTOPILOT_MAX_NEW_DOCS_PER_CYCLE,
     AUTOPILOT_RECHECK_ALL_ON_START,
     AUTOPILOT_START_WITH_AUTO_ORGANIZE,
+    KNOWLEDGE_DB_URL,
     LEARNING_EXAMPLES_FILE,
     LEARNING_PROFILE_FILE,
     LIVE_WATCH_COMPACT_FIRST,
@@ -76,6 +77,7 @@ from .guardrails import (
     _detect_content_hints,
     build_decision_context,
 )
+from .knowledge import KnowledgeDB
 from .learning import LearningExamples, LearningProfile
 from .llm import LocalLLMAnalyzer
 from .models import DecisionContext, ProcessingContext
@@ -107,6 +109,8 @@ class App:
         self.taxonomy = TagTaxonomy(TAXONOMY_FILE)
         self.learning_profile = LearningProfile(LEARNING_PROFILE_FILE)
         self.learning_examples = LearningExamples(LEARNING_EXAMPLES_FILE)
+        self.knowledge_db: KnowledgeDB | None = None
+        self._init_knowledge_db()
         self._active_run_id = None
         self._setup_signal_handlers()
 
@@ -126,6 +130,20 @@ class App:
             signal.signal(signal.SIGTERM, _handle_signal)
         except (OSError, AttributeError):
             pass
+
+    def _init_knowledge_db(self) -> bool:
+        """Initialize Knowledge DB if configured."""
+        if not KNOWLEDGE_DB_URL:
+            log.debug("KnowledgeDB: KNOWLEDGE_DB_URL nicht gesetzt, uebersprungen")
+            return False
+        try:
+            self.knowledge_db = KnowledgeDB(KNOWLEDGE_DB_URL)
+            log.info("KnowledgeDB: Verbunden (%s)", KNOWLEDGE_DB_URL.split("@")[-1] if "@" in KNOWLEDGE_DB_URL else KNOWLEDGE_DB_URL)
+            return True
+        except Exception as exc:
+            log.warning(f"KnowledgeDB: Verbindung fehlgeschlagen: {exc}")
+            self.knowledge_db = None
+            return False
 
     def _start_run(self, action: str) -> int:
         run_id = self.run_db.start_run(action, self.dry_run, self.llm_model, self.llm_url)
@@ -307,6 +325,7 @@ class App:
             decision_context=decision_context,
             learning_profile=self.learning_profile,
             learning_examples=self.learning_examples,
+            knowledge_db=self.knowledge_db,
             run_db=self.run_db,
             run_id=run_id,
         )
@@ -320,6 +339,7 @@ class App:
             correspondents,
             storage_paths,
             learning_profile=self.learning_profile,
+            knowledge_db=self.knowledge_db,
         )
         log.info(
             "KONTEXT gesammelt: %s Dokumente | %s Arbeitgeber-Hints | %s Anbieter-Hints | %s Jobs | %s/%s Fahrzeuge",
@@ -398,6 +418,15 @@ class App:
         """Hauptmenue."""
         while True:
             self._show_header()
+            kb_label = ""
+            if self.knowledge_db:
+                try:
+                    ks = self.knowledge_db.get_statistics()
+                    kb_label = f" [{ks['entities']} Entities, {ks['active_facts']} Fakten]"
+                except Exception:
+                    kb_label = " [verbunden]"
+            else:
+                kb_label = " [nicht konfiguriert]"
             choice = self._menu("Hauptmenue", [
                 ("1", "Alles sortieren (unsortierte Dokumente automatisch organisieren)"),
                 ("2", "Dokumente organisieren (erweiterte Optionen)"),
@@ -408,6 +437,7 @@ class App:
                 ("7", "Einstellungen"),
                 ("8", "Live-Watch (neue Dokumente automatisch verarbeiten)"),
                 ("9", "Vollautomatik (Sortieren + Live-Watch + Wartung)"),
+                ("10", f"Wissensdatenbank{kb_label}"),
                 ("0", "Beenden"),
             ])
 
@@ -429,6 +459,8 @@ class App:
                 self._run_action_safely(self.action_live_watch, "Live-Watch")
             elif choice == "9":
                 self._run_action_safely(self.action_autopilot, "Vollautomatik")
+            elif choice == "10":
+                self._run_action_safely(self.menu_knowledge, "Wissensdatenbank")
             elif choice == "0":
                 console.print("[bold]Auf Wiedersehen![/bold]")
                 break
@@ -1749,6 +1781,250 @@ class App:
                     self.llm_model = best
                     console.print(f"[green]Modell gewechselt: {best}[/green]")
 
+    def menu_knowledge(self):
+        """Untermenue: Wissensdatenbank."""
+        if not self.knowledge_db:
+            if not KNOWLEDGE_DB_URL:
+                console.print("[yellow]KNOWLEDGE_DB_URL nicht in .env konfiguriert.[/yellow]")
+                console.print("[dim]Beispiel: KNOWLEDGE_DB_URL=postgresql://admin:admin@192.168.178.118:5434/paperless_knowledge[/dim]")
+                return
+            if not self._init_knowledge_db():
+                console.print("[red]Verbindung zur Knowledge-DB fehlgeschlagen.[/red]")
+                return
+
+        choice = self._menu("Wissensdatenbank", [
+            ("1", "Alle Fakten anzeigen"),
+            ("2", "Fakten nach Typ filtern"),
+            ("3", "Entitaeten anzeigen"),
+            ("4", "Zeitstrahl (letzte Ereignisse)"),
+            ("5", "Fakt manuell hinzufuegen"),
+            ("6", "Fakt deaktivieren"),
+            ("7", "Migration von learning_profile.json"),
+            ("8", "Prompt-Kontext Vorschau"),
+            ("9", "Statistiken"),
+            ("0", "Zurueck"),
+        ])
+
+        if choice == "1":
+            self._kb_show_facts()
+        elif choice == "2":
+            self._kb_show_facts_by_type()
+        elif choice == "3":
+            self._kb_show_entities()
+        elif choice == "4":
+            self._kb_show_timeline()
+        elif choice == "5":
+            self._kb_add_manual_fact()
+        elif choice == "6":
+            self._kb_deactivate_fact()
+        elif choice == "7":
+            self._kb_run_migration()
+        elif choice == "8":
+            self._kb_show_prompt_preview()
+        elif choice == "9":
+            self._kb_show_statistics()
+
+    def _kb_show_facts(self):
+        """Show all current facts."""
+        facts = self.knowledge_db.get_current_facts()
+        if not facts:
+            console.print("[dim]Keine Fakten in der Datenbank.[/dim]")
+            return
+        table = Table(title=f"Aktive Fakten ({len(facts)})", show_header=True)
+        table.add_column("ID", style="dim", width=5)
+        table.add_column("Typ", style="cyan", width=20)
+        table.add_column("Entity", style="green", width=25)
+        table.add_column("Zusammenfassung", width=45)
+        table.add_column("Gueltig", width=22)
+        table.add_column("Konf.", justify="right", width=5)
+        for f in facts[:100]:
+            valid = ""
+            if f["valid_from"]:
+                valid = str(f["valid_from"])
+            if f["valid_until"]:
+                valid += f" - {f['valid_until']}"
+            conf_str = f"{f['confidence']:.0%}" if f["confidence"] else ""
+            table.add_row(
+                str(f["id"]), f["fact_type"],
+                f["entity_name"] or "-", f["summary"][:45],
+                valid, conf_str,
+            )
+        console.print(table)
+
+    def _kb_show_facts_by_type(self):
+        """Show facts filtered by type."""
+        from .knowledge import VALID_FACT_TYPES
+        types_sorted = sorted(VALID_FACT_TYPES)
+        console.print("[cyan]Verfuegbare Faktentypen:[/cyan]")
+        for i, ft in enumerate(types_sorted, 1):
+            console.print(f"  {i}. {ft}")
+        idx_str = Prompt.ask("Typ-Nummer", default="1")
+        try:
+            idx = max(0, int(idx_str) - 1)
+            ft = types_sorted[idx]
+        except (ValueError, IndexError):
+            console.print("[red]Ungueltige Auswahl.[/red]")
+            return
+        facts = self.knowledge_db.get_current_facts(fact_type=ft)
+        if not facts:
+            console.print(f"[dim]Keine Fakten vom Typ '{ft}'.[/dim]")
+            return
+        table = Table(title=f"Fakten: {ft} ({len(facts)})", show_header=True)
+        table.add_column("ID", style="dim", width=5)
+        table.add_column("Entity", style="green", width=25)
+        table.add_column("Zusammenfassung", width=50)
+        table.add_column("Gueltig", width=22)
+        table.add_column("Konf.", justify="right", width=5)
+        for f in facts:
+            valid = ""
+            if f["valid_from"]:
+                valid = str(f["valid_from"])
+            if f["valid_until"]:
+                valid += f" - {f['valid_until']}"
+            conf_str = f"{f['confidence']:.0%}" if f["confidence"] else ""
+            table.add_row(
+                str(f["id"]), f["entity_name"] or "-",
+                f["summary"][:50], valid, conf_str,
+            )
+        console.print(table)
+
+    def _kb_show_entities(self):
+        """Show all entities."""
+        entities = self.knowledge_db.get_all_entities()
+        if not entities:
+            console.print("[dim]Keine Entitaeten in der Datenbank.[/dim]")
+            return
+        table = Table(title=f"Entitaeten ({len(entities)})", show_header=True)
+        table.add_column("ID", style="dim", width=5)
+        table.add_column("Typ", style="cyan", width=14)
+        table.add_column("Name", style="green", width=40)
+        table.add_column("Attribute", width=30)
+        for e in entities:
+            attrs = json.dumps(e["attributes"], ensure_ascii=False)[:30] if e["attributes"] else ""
+            table.add_row(str(e["id"]), e["entity_type"], e["name"], attrs)
+        console.print(table)
+
+    def _kb_show_timeline(self):
+        """Show fact timeline."""
+        timeline = self.knowledge_db.get_fact_timeline(limit=30)
+        if not timeline:
+            console.print("[dim]Keine Ereignisse.[/dim]")
+            return
+        table = Table(title="Zeitstrahl (letzte 30 Ereignisse)", show_header=True)
+        table.add_column("Datum", style="cyan", width=12)
+        table.add_column("Typ", width=20)
+        table.add_column("Entity", style="green", width=20)
+        table.add_column("Zusammenfassung", width=45)
+        table.add_column("Aktiv", width=5)
+        for f in timeline:
+            d = str(f["valid_from"]) if f["valid_from"] else str(f["created_at"])[:10]
+            active = "[green]ja[/green]" if f["is_current"] else "[dim]nein[/dim]"
+            table.add_row(
+                d, f["fact_type"],
+                f["entity_name"] or "-",
+                f["summary"][:45], active,
+            )
+        console.print(table)
+
+    def _kb_add_manual_fact(self):
+        """Add a fact manually."""
+        from .knowledge import VALID_ENTITY_TYPES, VALID_FACT_TYPES
+        entity_type = Prompt.ask("Entity-Typ", default="company",
+                                 choices=sorted(VALID_ENTITY_TYPES))
+        entity_name = Prompt.ask("Entity-Name")
+        if not entity_name:
+            return
+        fact_type = Prompt.ask("Fakten-Typ", default="note",
+                               choices=sorted(VALID_FACT_TYPES))
+        summary = Prompt.ask("Zusammenfassung")
+        if not summary:
+            return
+        valid_from = Prompt.ask("Gueltig ab (YYYY-MM-DD, leer=unbekannt)", default="")
+        valid_until = Prompt.ask("Gueltig bis (YYYY-MM-DD, leer=offen)", default="")
+
+        fact_id = self.knowledge_db.store_manual_fact(
+            fact_type=fact_type,
+            entity_type=entity_type,
+            entity_name=entity_name,
+            summary=summary,
+            valid_from=valid_from or None,
+            valid_until=valid_until or None,
+        )
+        if fact_id:
+            console.print(f"[green]Fakt #{fact_id} gespeichert.[/green]")
+        else:
+            console.print("[yellow]Fakt wurde nicht gespeichert (Duplikat oder niedrige Konfidenz).[/yellow]")
+
+    def _kb_deactivate_fact(self):
+        """Deactivate a fact by ID."""
+        id_str = Prompt.ask("Fakt-ID zum Deaktivieren")
+        try:
+            fact_id = int(id_str)
+        except ValueError:
+            console.print("[red]Ungueltige ID.[/red]")
+            return
+        if Confirm.ask(f"Fakt #{fact_id} wirklich deaktivieren?"):
+            self.knowledge_db.deactivate_fact(fact_id)
+            console.print(f"[green]Fakt #{fact_id} deaktiviert.[/green]")
+
+    def _kb_run_migration(self):
+        """Run migration from learning_profile.json."""
+        if self.knowledge_db.is_migrated():
+            if not Confirm.ask("[yellow]Migration wurde bereits durchgefuehrt. Erneut ausfuehren?[/yellow]"):
+                return
+        console.print("[cyan]Migriere learning_profile.json -> Knowledge-DB...[/cyan]")
+        try:
+            stats = self.knowledge_db.migrate_from_learning_profile(self.learning_profile.data)
+            table = Table(title="Migration Ergebnis", show_header=True, width=40)
+            table.add_column("Metrik", style="cyan")
+            table.add_column("Wert", justify="right", style="bold")
+            table.add_row("Entitaeten erstellt", str(stats["entities"]))
+            table.add_row("Fakten erstellt", str(stats["facts"]))
+            table.add_row("Uebersprungen", str(stats["skipped"]))
+            table.add_row("OCR-Merges", str(stats["merged_ocr"]))
+            console.print(table)
+        except Exception as exc:
+            console.print(f"[red]Migration fehlgeschlagen: {exc}[/red]")
+
+    def _kb_show_prompt_preview(self):
+        """Show the generated prompt context."""
+        owner = self.learning_profile.data.get("owner", "Document Owner")
+        from . import config as _kcfg
+        max_len = getattr(_kcfg, "KNOWLEDGE_PROMPT_MAX_LENGTH", 400)
+        context = self.knowledge_db.build_prompt_context(owner, max_len=max_len)
+        console.print(Panel(
+            context,
+            title=f"Prompt-Kontext (max {max_len} Zeichen, aktuell {len(context)})",
+            border_style="green",
+        ))
+
+    def _kb_show_statistics(self):
+        """Show knowledge DB statistics."""
+        stats = self.knowledge_db.get_statistics()
+        table = Table(title="Wissensdatenbank", show_header=True, width=45)
+        table.add_column("Metrik", style="cyan")
+        table.add_column("Wert", justify="right", style="bold")
+        table.add_row("Entitaeten", str(stats["entities"]))
+        table.add_row("Aktive Fakten", str(stats["active_facts"]))
+        table.add_row("Ersetzte Fakten", str(stats["superseded_facts"]))
+        table.add_row("Dokumente mit Fakten", str(stats["docs_with_facts"]))
+        table.add_row("Beziehungen", str(stats["relations"]))
+        console.print(table)
+        if stats["entity_types"]:
+            et_table = Table(title="Entitaeten nach Typ", show_header=True, width=35)
+            et_table.add_column("Typ", style="cyan")
+            et_table.add_column("Anzahl", justify="right")
+            for et, count in stats["entity_types"].items():
+                et_table.add_row(et, str(count))
+            console.print(et_table)
+        if stats["fact_types"]:
+            ft_table = Table(title="Fakten nach Typ", show_header=True, width=35)
+            ft_table.add_column("Typ", style="cyan")
+            ft_table.add_column("Anzahl", justify="right")
+            for ft, count in stats["fact_types"].items():
+                ft_table.add_row(ft, str(count))
+            console.print(ft_table)
+
     def action_find_duplicates(self):
         """Duplikate finden."""
         if not self._init_paperless():
@@ -1995,6 +2271,8 @@ def main():
         console.print("\n[bold]Abgebrochen.[/bold]")
     finally:
         try:
+            if app.knowledge_db:
+                app.knowledge_db.close()
             log.info("Paperless-NGX Organizer beendet")
         except KeyboardInterrupt:
             pass

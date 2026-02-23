@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .client import PaperlessClient
     from .db import LocalStateDB
+    from .knowledge import KnowledgeDB
     from .learning import LearningExamples, LearningProfile
     from .llm import LocalLLMAnalyzer
     from .taxonomy import TagTaxonomy
@@ -24,6 +25,7 @@ class DecisionContext:
     profile_private_vehicles: list[str] = field(default_factory=list)
     profile_company_vehicles: list[str] = field(default_factory=list)
     profile_context_text: str = ""
+    knowledge_context_text: str = ""
     notes: list[str] = field(default_factory=list)
 
 
@@ -40,6 +42,7 @@ class ProcessingContext:
     decision_context: DecisionContext | None = None
     learning_profile: LearningProfile | None = None
     learning_examples: LearningExamples | None = None
+    knowledge_db: KnowledgeDB | None = None
     run_db: LocalStateDB | None = None
     run_id: int | None = None
 
@@ -56,6 +59,7 @@ class ProcessingContext:
             decision_context=self.decision_context,
             learning_profile=self.learning_profile,
             learning_examples=self.learning_examples,
+            knowledge_db=self.knowledge_db,
             run_db=self.run_db,
             run_id=self.run_id,
         )

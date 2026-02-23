@@ -460,11 +460,13 @@ class LocalLLMAnalyzer:
             providers_info = "keine"
         work_paths_info = ", ".join(decision_context.top_work_paths) if decision_context else "keine"
         private_paths_info = ", ".join(decision_context.top_private_paths) if decision_context else "keine"
-        profile_context = (
-            decision_context.profile_context_text
-            if decision_context and decision_context.profile_context_text
-            else "Kein Profil-Kontext verfuegbar."
-        )
+        # Prefer knowledge DB context over legacy profile context
+        if decision_context and decision_context.knowledge_context_text:
+            profile_context = decision_context.knowledge_context_text
+        elif decision_context and decision_context.profile_context_text:
+            profile_context = decision_context.profile_context_text
+        else:
+            profile_context = "Kein Profil-Kontext verfuegbar."
         examples_text = "keine"
         if few_shot_examples and not compact_mode:
             lines = []

@@ -55,7 +55,7 @@ from .web_hints import _fetch_entity_web_hint
 # ---------------------------------------------------------------------------
 
 def build_decision_context(documents: list, correspondents: list, storage_paths: list,
-                           learning_profile=None) -> DecisionContext:
+                           learning_profile=None, knowledge_db=None) -> DecisionContext:
     """Collect current system data before making document decisions."""
     from collections import defaultdict
     context = DecisionContext()
@@ -91,6 +91,17 @@ def build_decision_context(documents: list, correspondents: list, storage_paths:
         context.profile_private_vehicles = learning_profile.private_vehicle_hints()
         context.profile_company_vehicles = learning_profile.company_vehicle_hints()
         context.profile_context_text = learning_profile.prompt_context_text()
+    # Knowledge DB context (preferred over profile_context_text when available)
+    if knowledge_db:
+        try:
+            from . import config as _kcfg
+            owner = learning_profile.data.get("owner", "Document Owner") if learning_profile else "Document Owner"
+            max_len = getattr(_kcfg, "KNOWLEDGE_PROMPT_MAX_LENGTH", 400)
+            ktext = knowledge_db.build_prompt_context(owner, max_len=max_len)
+            if ktext and len(ktext) > 30:
+                context.knowledge_context_text = ktext
+        except Exception as exc:
+            log.debug("KnowledgeDB-Kontext konnte nicht geladen werden: %s", exc)
     for norm_name, count in sorted(work_corr_counts.items(), key=lambda x: x[1], reverse=True):
         if count >= WORK_CORR_EMPLOYER_MIN_DOCS:
             context.employer_names.add(norm_name)
@@ -445,6 +456,188 @@ def _apply_learning_guardrails(suggestion: dict, storage_paths: list, learning_h
             corrections.append(f"tags+{added_tags} (learning prior)")
 
     return corrections
+
+
+def _apply_knowledge_guardrails(document: dict, suggestion: dict,
+                                storage_paths: list, knowledge_db=None) -> list[str]:
+    """Apply guardrails dynamically based on ALL Knowledge DB facts.
+
+    Fully dynamic: every known entity and fact type is used to validate and
+    correct the LLM's storage path suggestion. Nothing is hardcoded to specific
+    companies or categories - it works with whatever the DB has learned.
+    """
+    corrections: list[str] = []
+    if not knowledge_db:
+        return corrections
+
+    try:
+        facts = knowledge_db.get_current_facts()
+        entities = knowledge_db.get_all_entities()
+    except Exception:
+        return corrections
+
+    if not facts and not entities:
+        return corrections
+
+    content = (document.get("content") or "").lower()
+    title = (suggestion.get("title") or document.get("title") or "").lower()
+    correspondent = (suggestion.get("correspondent") or "").lower()
+    current_path = (suggestion.get("storage_path") or "").lower()
+    text_combined = f"{title} {correspondent} {content[:2000]}"
+
+    path_names = [p["name"] for p in storage_paths]
+
+    # --- Phase 1: Build knowledge index ---
+    # Map: entity_name_lower -> list of (fact_type, detail, entity_type)
+    entity_facts: dict[str, list[tuple[str, dict, str]]] = {}
+    education_active = False
+    education_employer = ""
+    education_institutions: list[str] = []
+
+    for fact in facts:
+        ft = fact["fact_type"]
+        detail = fact.get("detail") or {}
+        entity_name = (fact.get("entity_name") or "").strip()
+        entity_type = fact.get("entity_type") or ""
+        if entity_name:
+            entity_facts.setdefault(entity_name.lower(), []).append((ft, detail, entity_type))
+
+        # Track active education globally (needed for related-institution logic)
+        if ft in ("education_start", "education_active"):
+            education_active = True
+            education_employer = (
+                detail.get("related_to") or detail.get("arbeitgeber") or ""
+            ).lower()
+            # Collect all institutions mentioned in education facts
+            inst = detail.get("institution") or ""
+            if inst:
+                education_institutions.append(inst.lower())
+
+    # --- Phase 2: Find which known entities appear in this document ---
+    matched_facts: list[tuple[str, str, dict, str]] = []  # (fact_type, entity_name, detail, entity_type)
+
+    for entity_name_lower, fact_list in entity_facts.items():
+        # Check if entity appears in correspondent or title (high confidence)
+        if entity_name_lower in correspondent or entity_name_lower in title:
+            for ft, detail, et in fact_list:
+                matched_facts.append((ft, entity_name_lower, detail, et))
+
+    # --- Phase 3: Education context (IHK, Berufsschule, etc.) ---
+    # If education is active, check if document is education-related
+    if education_active:
+        # Dynamic keyword list from education institutions + standard terms
+        edu_keywords = {
+            "ihk", "berufsschule", "handelskammer", "pruefung",
+            "pruefungsausschuss", "ausbildung", "azubi", "umschulung",
+            "bildungsgutschein", "bildungstraeger", "abschlusspruefung",
+            "zwischenpruefung", "berichtsheft", "ausbildungsnachweis",
+            "ausbildungsvertrag", "lehrvertrag",
+        }
+        # Add learned institution names
+        for inst in education_institutions:
+            edu_keywords.add(inst)
+            # Also add parts (e.g. "IHK Chemnitz" -> "ihk")
+            for part in inst.split():
+                if len(part) > 2:
+                    edu_keywords.add(part)
+
+        if any(kw in text_combined for kw in edu_keywords):
+            if not current_path.startswith("arbeit"):
+                target = _find_best_path(path_names, [
+                    "ausbildung", "bildung",
+                    education_employer,
+                    "arbeit",
+                ])
+                if target:
+                    suggestion["storage_path"] = target
+                    corrections.append(
+                        f"storage_path->{target} (Knowledge: Ausbildung aktiv -> Arbeit)"
+                    )
+                    return corrections  # Education overrides everything
+
+    # --- Phase 4: Dynamic fact-type-to-path routing ---
+    # Map fact type prefixes to path search terms (ordered by specificity)
+    _FACT_PATH_MAP = {
+        "insurance":  ["versicherung"],
+        "health":     ["gesundheit"],
+        "vehicle":    ["auto", "fahrzeug", "kfz"],
+        "employment": ["arbeit"],
+        "education":  ["ausbildung", "bildung", "arbeit"],
+        "membership": ["verein", "mitgliedschaft", "freizeit"],
+        "bank":       ["finanzen", "bank"],
+        "financial":  ["finanzen"],
+        "regular_service": ["finanzen"],
+        "life_event": [],  # No automatic reroute for life events
+    }
+
+    for ft, entity_name, detail, entity_type in matched_facts:
+        # Find which category prefix this fact type belongs to
+        category_prefix = None
+        path_search_terms: list[str] = []
+        for prefix, terms in _FACT_PATH_MAP.items():
+            if ft.startswith(prefix):
+                category_prefix = prefix
+                path_search_terms = list(terms)
+                break
+
+        if not category_prefix or not path_search_terms:
+            continue
+
+        # Check if current path already matches the expected category
+        already_correct = any(term in current_path for term in path_search_terms)
+        if already_correct:
+            continue
+
+        # Only reroute if current path looks generic/wrong
+        is_generic_path = (
+            not current_path
+            or "allgemein" in current_path
+            or "korrespondenz" in current_path
+        )
+        # Also reroute if the path is clearly in the wrong category
+        is_wrong_category = False
+        if category_prefix == "insurance" and ("finanzen" in current_path or "freizeit" in current_path):
+            is_wrong_category = True
+        elif category_prefix == "health" and ("finanzen" in current_path or "freizeit" in current_path):
+            is_wrong_category = True
+        elif category_prefix == "vehicle" and "freizeit" in current_path:
+            is_wrong_category = True
+
+        if not is_generic_path and not is_wrong_category:
+            continue
+
+        # Sub-category from detail (e.g. "KFZ" for insurance_start with vehicle context)
+        sub_hints: list[str] = []
+        for key in ("typ", "type", "kategorie", "category", "sparte"):
+            val = detail.get(key)
+            if val:
+                sub_hints.append(val.lower())
+
+        target = _find_best_path(path_names, sub_hints + path_search_terms)
+        if target and target.lower() != current_path:
+            suggestion["storage_path"] = target
+            corrections.append(
+                f"storage_path->{target} (Knowledge: {entity_name} ist bekannt als {ft})"
+            )
+            break  # One correction per pass to avoid conflicts
+
+    return corrections
+
+
+def _find_best_path(path_names: list[str], search_terms: list[str]) -> str | None:
+    """Find the best matching storage path for a list of search terms.
+
+    Tries terms in order (most specific first). Returns first match or None.
+    """
+    for term in search_terms:
+        if not term:
+            continue
+        term_lower = term.lower()
+        # Exact sub-path match first (e.g. "Versicherungen/KFZ")
+        for p in path_names:
+            if term_lower in p.lower():
+                return p
+    return None
 
 
 # ---------------------------------------------------------------------------
