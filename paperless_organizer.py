@@ -43,10 +43,11 @@ load_dotenv()
 console = Console()
 
 # â”€â”€ Logging-Setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-LOG_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, "organizer.log")
 STATE_DB_FILE = os.path.join(LOG_DIR, "organizer_state.db")
-TAXONOMY_FILE = os.path.join(LOG_DIR, "taxonomy_tags.json")
+TAXONOMY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "taxonomy_tags.json")
 LEARNING_PROFILE_FILE = os.path.join(LOG_DIR, "learning_profile.json")
 LEARNING_EXAMPLES_FILE = os.path.join(LOG_DIR, "learning_examples.jsonl")
 
@@ -4213,6 +4214,7 @@ def process_document(doc_id: int, paperless: PaperlessClient,
     )
 
     # Rule-based fast path: skip LLM for well-known correspondent patterns
+    suggestion = None
     rule_suggestion = _try_rule_based_suggestion(document, learning_hints, storage_paths)
     if rule_suggestion:
         rule_suggestion["_rule_based"] = True
@@ -6521,7 +6523,7 @@ class App:
         if not self._init_analyzer():
             return
 
-        if not self.dry_run and not Confirm.ask(
+        if not self.dry_run and not getattr(self, "headless", False) and not Confirm.ask(
             "[red]Vollautomatik im LIVE-Modus starten?[/red]",
             default=True,
         ):
@@ -6587,6 +6589,14 @@ class App:
             dupscan_every,
         )
         console.print("[cyan]Vollautomatik laeuft. Stoppen mit Ctrl+C.[/cyan]")
+
+        # Set initial WebUI status
+        try:
+            from web import _webui_status
+            _webui_status["running"] = True
+            _webui_status["started_at"] = time.time()
+        except ImportError:
+            pass
 
         try:
             if AUTOPILOT_START_WITH_AUTO_ORGANIZE:
@@ -6792,6 +6802,24 @@ class App:
                         f"{total_updated}/{total_candidates} aktualisiert ({success_rate:.0f}%), "
                         f"{total_doc_failures} Fehler, {total_poll_errors} Poll-Fehler"
                     )
+
+                # Update WebUI status
+                try:
+                    from web import _webui_status
+                    _webui_status.update({
+                        "running": True, "cycle": cycle,
+                        "started_at": _webui_status.get("started_at") or time.time(),
+                        "last_cycle_at": time.time(),
+                        "seen_new": total_seen_new, "candidates": total_candidates,
+                        "updated": total_updated, "failed": total_doc_failures,
+                        "skipped_duplicates": total_skipped_duplicates,
+                        "skipped_organized": total_skipped_fully_organized,
+                        "poll_errors": total_poll_errors,
+                        "maintenance_runs": total_maintenance_runs,
+                        "reviews_resolved": total_reviews_resolved,
+                    })
+                except ImportError:
+                    pass
 
                 time.sleep(interval_sec)
         except KeyboardInterrupt:
@@ -7233,8 +7261,23 @@ def main():
     _show_startup_health()
     log.info("=" * 40)
     app = App()
+    headless = "--autopilot" in sys.argv
+    if headless:
+        app.headless = True
+        # Start WebUI if enabled
+        if os.getenv("WEBUI_ENABLED", "1").strip() == "1":
+            try:
+                from web import start_webui
+                webui_port = int(os.getenv("WEBUI_PORT", "5580"))
+                env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+                start_webui(app.run_db, LOG_FILE, env_file, port=webui_port)
+            except Exception as exc:
+                log.warning(f"WebUI konnte nicht gestartet werden: {exc}")
     try:
-        app.menu_main()
+        if headless:
+            app.action_autopilot()
+        else:
+            app.menu_main()
     except KeyboardInterrupt:
         console.print("\n[bold]Abgebrochen.[/bold]")
     finally:

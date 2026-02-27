@@ -1,0 +1,28 @@
+services:
+  organizer:
+    build: .
+    container_name: paperless-organizer
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "5580:5580"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - organizer-data:/data
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, time; state='/data/organizer_state.db'; exit(0 if os.path.exists(state) and time.time()-os.path.getmtime(state)<600 else 1)"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  organizer-data:
